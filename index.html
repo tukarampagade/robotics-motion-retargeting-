@@ -3,19 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MotionMirror AI</title>
-    <meta name="description" content="Real-time webcam humanoid robot motion mirroring with articulated half-body robotics, finger tracking, and interactive pick & place station." />
-    <meta property="og:title" content="MotionMirror AI" />
-    <meta property="og:description" content="Real-time webcam humanoid robot motion mirroring with articulated half-body robotics, finger tracking, and interactive pick & place station." />
-    <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <title>Random Joke Generator</title>
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <main class="app">
+      <h1>Random Joke Generator</h1>
+      <section class="joke-card" aria-live="polite">
+        <p id="setup" class="setup">Loading joke...</p>
+        <p id="punchline" class="punchline"></p>
+        <p id="error" class="error" role="alert"></p>
+      </section>
+      <button id="new-joke-btn" type="button">New Joke</button>
+      <p id="loading" class="loading" hidden>Loading...</p>
+    </main>
+    <script type="module" src="./dist/main.js"></script>
   </body>
 </html>
-
