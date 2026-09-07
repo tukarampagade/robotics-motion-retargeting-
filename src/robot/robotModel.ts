@@ -80,75 +80,122 @@ export function enforceBodyBoundary(
 
   let deflected = false;
   let maxPenetration = 0;
+  const softThresholdZone = 0.08; // 8cm soft-clamping deceleration zone
 
   // 1. Head & Neck Collision Volume:
-  // Center: (0, 0.82, 0.04), safe radius including hand thickness = 0.24m
-  if (ty > 0.62) {
+  // Center: (0, 0.82, 0.04), safe radius = 0.23m
+  if (ty > 0.60) {
     const headCenter = new THREE.Vector3(0, 0.82, 0.04);
     const toHead = new THREE.Vector3(tx, ty, tz).sub(headCenter);
     const distHead = toHead.length();
-    const rHeadSafe = 0.24;
-    if (distHead < rHeadSafe) {
-      const pen = rHeadSafe - distHead;
-      maxPenetration = Math.max(maxPenetration, pen);
-      deflected = true;
-      if (distHead > 1e-4) {
-        toHead.multiplyScalar(rHeadSafe / distHead);
+    const rHeadHard = 0.23;
+    const rHeadSoft = rHeadHard + softThresholdZone;
+
+    if (distHead < rHeadSoft) {
+      const norm = distHead > 1e-4 ? toHead.clone().normalize() : new THREE.Vector3(0, 0, 1);
+      if (distHead < rHeadHard) {
+        const pen = rHeadHard - distHead;
+        maxPenetration = Math.max(maxPenetration, pen);
+        deflected = true;
+        const clampedR = rHeadHard + 0.008 * Math.tanh(-pen / 0.008);
+        tx = headCenter.x + norm.x * clampedR;
+        ty = headCenter.y + norm.y * clampedR;
+        tz = headCenter.z + norm.z * clampedR;
       } else {
-        toHead.set(0, 0, rHeadSafe);
+        // Soft-clamping threshold: smoothly slow down arm movement towards boundary
+        const u = (distHead - rHeadHard) / softThresholdZone; // 1 -> 0
+        const smoothDecel = u * u * (3 - 2 * u);
+        const clampedR = rHeadHard + softThresholdZone * Math.pow(u, 1.45);
+        tx = headCenter.x + norm.x * clampedR;
+        ty = headCenter.y + norm.y * clampedR;
+        tz = headCenter.z + norm.z * clampedR;
+        deflected = true;
       }
-      tx = headCenter.x + toHead.x;
-      ty = headCenter.y + toHead.y;
-      tz = headCenter.z + toHead.z;
     }
   }
 
   // 2. Thorax, Ribs & Sculpted Chest Armor Collision Envelope (ty between -0.42 and 0.65)
+  // Chest box is width 0.44 (|tx| <= 0.22), height 0.42 (ty: 0.17..0.59), depth 0.24 (tz: -0.10..0.14)
+  // With sternum, vents, and forearm/hand thickness, front clearance requires tz >= 0.22m for |tx| < 0.26m.
   if (ty >= -0.42 && ty <= 0.65) {
     // Elliptical cross-section: Rx ~0.265m (chest) down to ~0.23m (waist)
     const tH = Math.max(0, Math.min(1, (ty + 0.42) / 1.07));
-    const rx = 0.24 + 0.035 * Math.sin(tH * Math.PI);
+    const rx = 0.245 + 0.035 * Math.sin(tH * Math.PI);
     const rz = 0.195;
     const zCenter = 0.02;
 
     const qx = tx / rx;
     const qz = (tz - zCenter) / rz;
     const distEllipse = Math.hypot(qx, qz);
+    const avgR = (rx + rz) * 0.5;
+    const deltaQSoft = softThresholdZone / avgR;
 
-    if (distEllipse < 1.0) {
-      const pen = (1.0 - distEllipse) * Math.max(rx, rz);
+    const isFrontChestCorridor = Math.abs(tx) < 0.26 && tz > -0.18;
+    const minFrontClearanceZ = 0.22;
+
+    if (isFrontChestCorridor && tz < minFrontClearanceZ) {
+      // Direct front chest anti-penetration: strictly push hand/wrist forward outside chest armor
+      const pen = minFrontClearanceZ - tz;
       maxPenetration = Math.max(maxPenetration, pen);
       deflected = true;
+      tz = minFrontClearanceZ;
+    } else if (distEllipse < 1.0 + deltaQSoft) {
+      if (distEllipse < 1.0) {
+        const pen = (1.0 - distEllipse) * avgR;
+        maxPenetration = Math.max(maxPenetration, pen);
+        deflected = true;
 
-      const factor = 1.0 / Math.max(distEllipse, 1e-4);
-      let outX = qx * factor * rx;
-      let outZ = zCenter + qz * factor * rz;
+        const clampedQ = 1.0 + 0.015 * Math.tanh((distEllipse - 1.0) / 0.015);
+        const factor = (1.0 / Math.max(distEllipse, 1e-4)) * clampedQ;
+        let outX = qx * factor * rx;
+        let outZ = zCenter + qz * factor * rz;
 
-      // When in front of torso, glide smoothly across front chest armor (z >= 0.21m)
-      if (tz >= -0.04) {
-        if (outZ < 0.21) {
-          outZ = 0.21;
+        if (tz > -0.12) {
+          if (outZ < 0.22) outZ = 0.22;
+        } else {
+          if (outZ > -0.18) outZ = -0.18;
         }
+        tx = outX;
+        tz = outZ;
       } else {
-        if (outZ > -0.17) {
-          outZ = -0.17;
+        // Soft-clamping threshold: smoothly slow down approaching arm movement
+        const u = (distEllipse - 1.0) / deltaQSoft;
+        const clampedQ = 1.0 + deltaQSoft * Math.pow(u, 1.45);
+        const factor = clampedQ / Math.max(distEllipse, 1e-4);
+        let outX = qx * factor * rx;
+        let outZ = zCenter + qz * factor * rz;
+
+        if (tz > -0.12 && outZ < 0.22) {
+          outZ = THREE.MathUtils.lerp(0.22, outZ, u);
         }
+        tx = outX;
+        tz = outZ;
+        deflected = true;
       }
-      tx = outX;
-      tz = outZ;
     }
   }
 
   // 3. Pelvis & Mount Base Collision Envelope (for ty < -0.42)
   if (ty < -0.42) {
-    const rPelvis = 0.24;
+    const rPelvisHard = 0.24;
+    const rPelvisSoft = rPelvisHard + softThresholdZone;
     const distP = Math.hypot(tx, tz);
-    if (distP < rPelvis) {
-      maxPenetration = Math.max(maxPenetration, rPelvis - distP);
-      deflected = true;
-      const s = rPelvis / Math.max(distP, 1e-4);
-      tx *= s;
-      tz *= s;
+    if (distP < rPelvisSoft) {
+      if (distP < rPelvisHard) {
+        maxPenetration = Math.max(maxPenetration, rPelvisHard - distP);
+        deflected = true;
+        const clampedR = rPelvisHard + 0.01 * Math.tanh(-(rPelvisHard - distP) / 0.01);
+        const s = clampedR / Math.max(distP, 1e-4);
+        tx *= s;
+        tz *= s;
+      } else {
+        const u = (distP - rPelvisHard) / softThresholdZone;
+        const clampedR = rPelvisHard + softThresholdZone * Math.pow(u, 1.45);
+        const s = clampedR / Math.max(distP, 1e-4);
+        tx *= s;
+        tz *= s;
+        deflected = true;
+      }
     }
   }
 
@@ -186,6 +233,7 @@ export class RobotArmIKSolver {
   // Temporal state for smooth swivel pole vector and anti-wandering stabilization
   private prevSwivelDir: THREE.Vector3;
   private naturalPoleRef: THREE.Vector3;
+  private prevSwivelAngle: number = 0;
   private prevShoulderAngles: { z: number; x: number; y: number };
   private prevElbowAngle: number;
   private isInitialized: boolean = false;
@@ -200,6 +248,7 @@ export class RobotArmIKSolver {
     // Anatomical natural elbow flare (elbow flares outward and slightly backward/down)
     this.naturalPoleRef = new THREE.Vector3(sign * 0.86, -0.28, -0.42).normalize();
     this.prevSwivelDir = this.naturalPoleRef.clone();
+    this.prevSwivelAngle = 0;
     this.prevShoulderAngles = { z: sign * 0.12, x: 0, y: 0 };
     this.prevElbowAngle = 0.15;
   }
@@ -207,6 +256,7 @@ export class RobotArmIKSolver {
   public reset(): void {
     const sign = this.side === 'left' ? -1 : 1;
     this.prevSwivelDir.copy(this.naturalPoleRef);
+    this.prevSwivelAngle = 0;
     this.prevShoulderAngles = { z: sign * 0.12, x: 0, y: 0 };
     this.prevElbowAngle = 0.15;
     this.isInitialized = false;
@@ -267,12 +317,21 @@ export class RobotArmIKSolver {
     dEff = Math.max(0.04, Math.min(maxHardLimit, dEff));
 
     // -------------------------------------------------------------
-    // 2. Anatomical Pole Vector & Swivel Regularization (Anti-Wandering)
+    // 2. Stable Constraint-Based Swivel Solver (Anti-Wandering)
     // -------------------------------------------------------------
-    // When the arm is fully extended, the elbow landmark lies directly on the
-    // line between shoulder and wrist. Projecting it yields near-zero magnitude,
-    // causing standard solvers to spin 360 degrees randomly (the "wandering" effect).
-    // We compute perpendicular projection and blend it with stabilized anatomical pole.
+    // We construct a continuous orthonormal coordinate frame {e1, e2} perpendicular to the
+    // arm axis u. The elbow swivel angle theta is measured and bounded within an anatomical
+    // constraint sector, completely eliminating 360-degree gimbal flips and wandering at full extension.
+    const sign = this.side === 'left' ? -1 : 1;
+    const lateralGuide = new THREE.Vector3(sign * 0.88, -0.22, 0.36).normalize();
+    let e1 = lateralGuide.clone().addScaledVector(u, -lateralGuide.dot(u));
+    if (e1.lengthSq() < 1e-4) {
+      const altGuide = new THREE.Vector3(0, 1, 0);
+      e1 = altGuide.clone().addScaledVector(u, -altGuide.dot(u));
+    }
+    e1.normalize();
+    const e2 = new THREE.Vector3().crossVectors(u, e1).normalize();
+
     let pPerp = new THREE.Vector3();
     let mPerp = 0;
 
@@ -282,50 +341,42 @@ export class RobotArmIKSolver {
       boundedElbowHint.copy(eRes.position);
     }
 
+    let measuredAngle = 0;
     if (boundedElbowHint && boundedElbowHint.lengthSq() > 1e-4) {
       pPerp.copy(boundedElbowHint).addScaledVector(u, -boundedElbowHint.dot(u));
       mPerp = pPerp.length();
-    }
-
-    // Confidence decays to zero when arm is straight or elbow projection is tiny (< 3cm)
-    const distFactor = Math.max(0, Math.min(1, (mPerp - 0.025) / 0.065));
-    const extensionFactor = Math.max(0, Math.min(1, (0.95 - reachRatio) / 0.12));
-    const swivelConfidence = distFactor * extensionFactor;
-
-    const targetPole = new THREE.Vector3();
-    if (swivelConfidence > 0.005) {
-      const normalizedRaw = pPerp.clone().multiplyScalar(1 / Math.max(mPerp, 1e-4));
-      targetPole.copy(normalizedRaw).multiplyScalar(swivelConfidence);
-
-      const stableRef = this.prevSwivelDir.clone().lerp(this.naturalPoleRef, 0.35).normalize();
-      targetPole.addScaledVector(stableRef, 1.0 - swivelConfidence);
-    } else {
-      // Under full extension: firmly lock to temporal previous & natural anatomical pole
-      targetPole.copy(this.prevSwivelDir).lerp(this.naturalPoleRef, 0.45).normalize();
-    }
-
-    // Anti-penetration clamp for elbow swivel pole:
-    // Prevent the elbow from pointing inwards towards the ribcage
-    const sign = this.side === 'left' ? -1 : 1;
-    if (this.bodyBoundaryEnabled) {
-      if (sign === -1 && targetPole.x > 0.06) {
-        targetPole.x = 0.06;
-      } else if (sign === 1 && targetPole.x < -0.06) {
-        targetPole.x = -0.06;
+      if (mPerp > 0.02) {
+        measuredAngle = Math.atan2(pPerp.dot(e2), pPerp.dot(e1));
       }
     }
 
-    // Strict orthogonality to arm axis u
-    targetPole.addScaledVector(u, -targetPole.dot(u));
-    if (targetPole.lengthSq() < 1e-5) {
-      targetPole.copy(this.naturalPoleRef).addScaledVector(u, -this.naturalPoleRef.dot(u));
-    }
-    targetPole.normalize();
+    // Biomechanical humanoid elbow constraint range:
+    // Strictly bounds the elbow rotation so it cannot tuck into the ribcage or hyperextend
+    const minAngle = -Math.PI * 0.30;
+    const maxAngle = Math.PI * 0.52;
+    const constrainedAngle = Math.max(minAngle, Math.min(maxAngle, measuredAngle));
 
-    // Temporal damping: heavier smoothing near singularity eliminates high-frequency wander
-    const swivelAlpha = !this.isInitialized ? 1.0 : isNearSingularity ? 0.14 : 0.32;
-    this.prevSwivelDir.lerp(targetPole, swivelAlpha).normalize();
-    const stabilizedSwivel = this.prevSwivelDir.clone();
+    // Near full extension: smoothly lock the elbow swivel angle to the stable constraint reference (theta = 0)
+    // This mathematically guarantees zero wandering or jitter when the arm is straightened.
+    const wReach = THREE.MathUtils.smoothstep(reachRatio, 0.92, 0.76);
+    const wPerp = THREE.MathUtils.clamp((mPerp - 0.025) / 0.055, 0, 1);
+    const swivelConfidence = wReach * wPerp;
+    const targetSwivelAngle = constrainedAngle * swivelConfidence;
+
+    // Continuous angular damping on shortest path
+    let angleDiff = targetSwivelAngle - this.prevSwivelAngle;
+    while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+    while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
+    const swivelAlpha = !this.isInitialized ? 1.0 : isNearSingularity ? 0.10 : 0.28;
+    this.prevSwivelAngle += angleDiff * swivelAlpha;
+
+    const stabilizedSwivel = new THREE.Vector3()
+      .copy(e1)
+      .multiplyScalar(Math.cos(this.prevSwivelAngle))
+      .addScaledVector(e2, Math.sin(this.prevSwivelAngle))
+      .normalize();
+    this.prevSwivelDir.copy(stabilizedSwivel);
 
     // -------------------------------------------------------------
     // 3. Analytical Two-Bone Law of Cosines
@@ -351,7 +402,40 @@ export class RobotArmIKSolver {
       }
     }
 
-    const solvedWrist = u.clone().multiplyScalar(dEff);
+    let solvedWrist = u.clone().multiplyScalar(dEff);
+
+    // -------------------------------------------------------------
+    // 3b. Full Forearm & Hand Collision Guard (Post-Kinematic Check)
+    // -------------------------------------------------------------
+    // Verify that the solved wrist, hand, and mid-forearm stay strictly in front of the chest armor
+    if (this.bodyBoundaryEnabled) {
+      const txE = solvedElbow.x + sign * 0.255;
+      const tyE = solvedElbow.y + 0.54;
+      const tzE = solvedElbow.z + 0.01;
+
+      let txW = solvedWrist.x + sign * 0.255;
+      let tyW = solvedWrist.y + 0.54;
+      let tzW = solvedWrist.z + 0.01;
+
+      const vForearmDir = new THREE.Vector3().subVectors(solvedWrist, solvedElbow).normalize();
+      const txHand = txW + vForearmDir.x * 0.10;
+      const tyHand = tyW + vForearmDir.y * 0.10;
+      const tzHand = tzW + vForearmDir.z * 0.10;
+      const midForearmZ = (tzE + tzW) * 0.5;
+
+      const minSafeChestZ = 0.22;
+      const inChestCorridor = Math.abs(txW) < 0.26 && tyW >= 0.10 && tyW <= 0.65;
+      if (inChestCorridor) {
+        const minZFound = Math.min(tzW, tzHand, midForearmZ);
+        if (minZFound < minSafeChestZ) {
+          const pushDeltaZ = minSafeChestZ - minZFound;
+          solvedWrist.z += pushDeltaZ;
+          dEff = solvedWrist.length();
+          isDeflected = true;
+          deflectionDistance = Math.max(deflectionDistance, pushDeltaZ);
+        }
+      }
+    }
 
     // Direction unit vectors
     const vUpper = solvedElbow.clone().multiplyScalar(1 / L1);
@@ -360,12 +444,6 @@ export class RobotArmIKSolver {
     // -------------------------------------------------------------
     // 4. Derivation of Robot Arm Joint Angles (ZXY Euler Order)
     // -------------------------------------------------------------
-    // In robot upperArmPivot, rest orientation extends along -Y.
-    // Elbow flexes around local +X, bending forearm towards local +Z.
-    // Therefore:
-    // local +Y = -vUpper
-    // local +Z = flexion direction dFlex
-    // local +X = local +Y x local +Z
     let dFlex = new THREE.Vector3().subVectors(vForearm, vUpper.clone().multiplyScalar(vForearm.dot(vUpper)));
     if (dFlex.lengthSq() < 1e-4) {
       dFlex.copy(stabilizedSwivel);
@@ -396,10 +474,10 @@ export class RobotArmIKSolver {
 
     this.isInitialized = true;
 
-    // Joint limit clamping
-    const limitsZ: [number, number] = this.side === 'left' ? [-2.6, 0.5] : [-0.5, 2.6];
-    const limitsX: [number, number] = [-1.4, 0.45];
-    const limitsY: [number, number] = [-0.95, 0.95];
+    // Joint limit clamping - expanded to permit natural forward cross-body reaching
+    const limitsZ: [number, number] = this.side === 'left' ? [-2.6, 1.2] : [-1.2, 2.6];
+    const limitsX: [number, number] = [-2.4, 0.85];
+    const limitsY: [number, number] = [-1.4, 1.4];
 
     return {
       shoulderZ: Math.max(limitsZ[0], Math.min(limitsZ[1], this.prevShoulderAngles.z)),
@@ -907,34 +985,25 @@ export function createHumanoidRobot(): HumanoidRobotRig {
   ventR.position.set(0.11, 0.38, 0.13);
   torso.add(ventR);
 
-  // Sternum central glow reactor / status light
+  // Sleek industrial sternum mount / access port (non-emissive, authentic cobot design)
   const chestCore = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.038, 0.038, 0.02, 16),
-    materials.chestReactor
+    new THREE.CylinderGeometry(0.024, 0.024, 0.008, 16),
+    materials.darkMechanism
   );
   chestCore.rotation.x = Math.PI / 2;
-  chestCore.position.set(0, 0.44, 0.135);
+  chestCore.position.set(0, 0.44, 0.132);
   torso.add(chestCore);
 
-  // Futuristic Quantum Reactor Outer Ring & Conduit Core
   const reactorRing = new THREE.Mesh(
-    new THREE.TorusGeometry(0.048, 0.005, 8, 24),
-    materials.energyConduit
+    new THREE.TorusGeometry(0.028, 0.003, 8, 20),
+    materials.titaniumSilver
   );
-  reactorRing.position.set(0, 0.44, 0.138);
+  reactorRing.position.set(0, 0.44, 0.133);
   torso.add(reactorRing);
 
-  // Futuristic Rotating Spoke Turbine inside reactor
+  // Hidden/disabled turbine & conduits to maximize responsiveness and eliminate visual distraction
   const reactorTurbine = new THREE.Group();
-  reactorTurbine.position.set(0, 0.44, 0.14);
-  for (let i = 0; i < 3; i++) {
-    const spoke = new THREE.Mesh(
-      new THREE.BoxGeometry(0.004, 0.032, 0.003),
-      materials.reactorCoreGlow
-    );
-    spoke.rotation.z = (i * Math.PI) / 3;
-    reactorTurbine.add(spoke);
-  }
+  reactorTurbine.visible = false;
   torso.add(reactorTurbine);
 
   // Upper clavicle armor plates
@@ -945,45 +1014,24 @@ export function createHumanoidRobot(): HumanoidRobotRig {
   clavicleArmor.position.set(0, 0.56, 0.01);
   torso.add(clavicleArmor);
 
-  // Futuristic Glowing Energy Conduits across Clavicle
   const conduitL = new THREE.Mesh(
-    new THREE.BoxGeometry(0.18, 0.008, 0.008),
-    materials.energyConduit
+    new THREE.BoxGeometry(0.001, 0.001, 0.001),
+    materials.darkMechanism
   );
-  conduitL.position.set(-0.12, 0.56, 0.102);
+  conduitL.visible = false;
   torso.add(conduitL);
 
   const conduitR = new THREE.Mesh(
-    new THREE.BoxGeometry(0.18, 0.008, 0.008),
-    materials.energyConduit
+    new THREE.BoxGeometry(0.001, 0.001, 0.001),
+    materials.darkMechanism
   );
-  conduitR.position.set(0.12, 0.56, 0.102);
+  conduitR.visible = false;
   torso.add(conduitR);
 
-  // Holographic Body Boundary Collision Envelope Shield (Visual Shield Mesh & Wireframe)
+  // Body Boundary collision envelope group (purely non-visual, zero occlusion)
   const boundaryShieldGroup = new THREE.Group();
   boundaryShieldGroup.visible = false;
   torso.add(boundaryShieldGroup);
-
-  // Torso and Ribcage Boundary Shield
-  const torsoShieldGeom = new THREE.CylinderGeometry(0.30, 0.27, 0.78, 20, 4);
-  const torsoShieldMesh = new THREE.Mesh(torsoShieldGeom, materials.boundaryShield);
-  torsoShieldMesh.position.set(0, 0.32, 0.02);
-  boundaryShieldGroup.add(torsoShieldMesh);
-
-  const torsoShieldWire = new THREE.Mesh(torsoShieldGeom, materials.boundaryShieldWire);
-  torsoShieldWire.position.set(0, 0.32, 0.02);
-  boundaryShieldGroup.add(torsoShieldWire);
-
-  // Cranial & Visor Boundary Shield Dome
-  const headDomeGeom = new THREE.SphereGeometry(0.24, 18, 12);
-  const headDomeMesh = new THREE.Mesh(headDomeGeom, materials.boundaryShield);
-  headDomeMesh.position.set(0, 0.82, 0.04);
-  boundaryShieldGroup.add(headDomeMesh);
-
-  const headDomeWire = new THREE.Mesh(headDomeGeom, materials.boundaryShieldWire);
-  headDomeWire.position.set(0, 0.82, 0.04);
-  boundaryShieldGroup.add(headDomeWire);
 
 
   // -------------------------------------------------------------
@@ -1321,8 +1369,8 @@ export function createHumanoidRobot(): HumanoidRobotRig {
     updatePoseWithIK,
     getHandWorldPosition,
     boundaryShieldGroup,
-    setBoundaryShieldVisible: (visible: boolean) => {
-      boundaryShieldGroup.visible = visible;
+    setBoundaryShieldVisible: (_visible: boolean) => {
+      boundaryShieldGroup.visible = false;
     },
     setBodyBoundaryEnabled: (enabled: boolean) => {
       leftIKSolver.bodyBoundaryEnabled = enabled;
@@ -1335,26 +1383,14 @@ export function createHumanoidRobot(): HumanoidRobotRig {
       rightPenetration: rightIKSolver.lastDeflectionAmount,
     }),
     updateFuturisticEffects: (
-      dt: number,
+      _dt: number,
       isDeflectingLeft: boolean,
       isDeflectingRight: boolean,
-      futuristicMode: boolean
+      _futuristicMode: boolean
     ) => {
       const isDeflecting = isDeflectingLeft || isDeflectingRight;
-      // High-tech quantum arc-reactor spin
-      const spinSpeed = isDeflecting ? 8.5 : 3.0;
-      reactorTurbine.rotation.z += dt * spinSpeed;
 
-      // Real-time emissive pulse across cyan reactor core and conduits
-      const pulse = 0.5 + 0.5 * Math.sin(Date.now() * 0.0035);
-      materials.chestReactor.emissiveIntensity = futuristicMode
-        ? 0.95 + 0.55 * pulse
-        : 0.65 + 0.25 * pulse;
-      materials.energyConduit.emissiveIntensity = futuristicMode
-        ? 1.35 + 0.65 * pulse
-        : 0.85;
-
-      // Dynamic reactive boundary shield glow
+      // Dynamic reactive boundary shield glow (if user has enabled shield visualization)
       if (boundaryShieldGroup.visible) {
         if (isDeflecting) {
           const flash = Math.sin(Date.now() * 0.02);

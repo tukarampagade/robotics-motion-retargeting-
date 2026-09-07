@@ -19,8 +19,6 @@ import {
   ShieldCheck,
   Sparkles,
   SunMedium,
-  Volume2,
-  VolumeX,
   Wind,
   Zap,
 } from 'lucide-react';
@@ -37,7 +35,6 @@ interface RobotViewportProps {
   heldObject: PickableObject | null;
   placedCount: number;
   showGestureGuide: boolean;
-  soundEnabled: boolean;
   motionTrailsEnabled: boolean;
   studioLightingEnabled: boolean;
   bodyBoundaryEnabled?: boolean;
@@ -49,7 +46,6 @@ interface RobotViewportProps {
   onSetCameraPreset: (preset: 'front' | '3q' | 'side' | 'top' | 'close') => void;
   onResetPickPlace: () => void;
   onToggleGestureGuide: () => void;
-  onToggleSound: () => void;
   onToggleMotionTrails: () => void;
   onToggleStudioLighting: () => void;
   onToggleBodyBoundary?: () => void;
@@ -67,19 +63,17 @@ export const RobotViewport: React.FC<RobotViewportProps> = ({
   heldObject,
   placedCount,
   showGestureGuide,
-  soundEnabled,
   motionTrailsEnabled,
   studioLightingEnabled,
   bodyBoundaryEnabled = true,
-  showBodyBoundaryShield = true,
-  futuristicMode = true,
+  showBodyBoundaryShield = false,
+  futuristicMode = false,
   isDeflectedLeft = false,
   isDeflectedRight = false,
   isSaccading = false,
   onSetCameraPreset,
   onResetPickPlace,
   onToggleGestureGuide,
-  onToggleSound,
   onToggleMotionTrails,
   onToggleStudioLighting,
   onToggleBodyBoundary,
@@ -98,31 +92,15 @@ export const RobotViewport: React.FC<RobotViewportProps> = ({
             ROBOT MIRROR (HALF-BODY)
           </span>
           <span className="text-slate-300">|</span>
-          <span className="text-cyan-700 font-medium hidden sm:inline">
-            {futuristicMode ? 'QUANTUM CYBER CORE' : 'LIGHT LAB ENVIRONMENT'}
+          <span className="text-slate-600 font-medium hidden sm:inline">
+            CLEAN LAB ENVIRONMENT
           </span>
         </div>
 
         {/* Viewport Sub-Controls: Quick toggles + Camera View Angle Presets */}
         <div className="flex items-center gap-2">
-          {/* Quick Audio, Trail, Lighting, Boundary & Futuristic Toggles */}
+          {/* Quick Trail, Lighting, Boundary Toggles */}
           <div className="flex items-center gap-1 pr-2 border-r border-slate-200">
-            <button
-              onClick={onToggleSound}
-              className={`p-1 rounded text-[10px] font-mono transition-colors flex items-center gap-1 ${
-                soundEnabled
-                  ? 'bg-cyan-50 text-cyan-700 hover:bg-cyan-100/70 border border-cyan-200'
-                  : 'bg-slate-100 text-slate-500 hover:bg-slate-200/80'
-              }`}
-              title={soundEnabled ? 'Mute servo audio' : 'Enable servo audio'}
-            >
-              {soundEnabled ? (
-                <Volume2 className="w-3 h-3 text-cyan-600" />
-              ) : (
-                <VolumeX className="w-3 h-3 text-slate-400" />
-              )}
-            </button>
-
             <button
               onClick={onToggleMotionTrails}
               className={`p-1 rounded text-[10px] font-mono transition-colors flex items-center gap-1 ${
@@ -172,24 +150,6 @@ export const RobotViewport: React.FC<RobotViewportProps> = ({
                 ) : (
                   <Shield className="w-3 h-3 text-slate-400" />
                 )}
-              </button>
-            )}
-
-            {onToggleFuturistic && (
-              <button
-                onClick={onToggleFuturistic}
-                className={`p-1 rounded text-[10px] font-mono transition-colors flex items-center gap-1 ${
-                  futuristicMode
-                    ? 'bg-cyan-50 text-cyan-700 hover:bg-cyan-100/70 border border-cyan-200 shadow-2xs'
-                    : 'bg-slate-100 text-slate-500 hover:bg-slate-200/80'
-                }`}
-                title={
-                  futuristicMode
-                    ? 'Futuristic Cyber-Core & Forcefield ON'
-                    : 'Enable futuristic cyber-core'
-                }
-              >
-                <Zap className={`w-3 h-3 ${futuristicMode ? 'text-cyan-500 fill-cyan-400/40' : 'text-slate-400'}`} />
               </button>
             )}
 
@@ -259,14 +219,6 @@ export const RobotViewport: React.FC<RobotViewportProps> = ({
             </div>
           )}
 
-          {/* Futuristic Cyber Core Badge */}
-          {futuristicMode && (
-            <div className="px-2.5 py-0.5 rounded-md bg-slate-900/85 text-cyan-300 border border-cyan-500/40 shadow-2xs backdrop-blur-xs font-mono text-[10px] font-medium flex items-center gap-1.5">
-              <Cpu className="w-3 h-3 text-cyan-400 animate-spin-slow" />
-              <span>QUANTUM CORE ONLINE</span>
-            </div>
-          )}
-
           {/* Active Gesture badge */}
           {gesture !== '—' && gesture !== 'MIRRORING' && (
             <div className="px-2.5 py-0.5 rounded-md bg-cyan-50/90 border border-cyan-200 shadow-2xs backdrop-blur-xs font-mono text-[10px] text-cyan-800 font-semibold flex items-center gap-1.5">
@@ -327,18 +279,13 @@ export const RobotViewport: React.FC<RobotViewportProps> = ({
       <div className="h-8 px-4 bg-white/90 border-t border-slate-200/80 flex items-center justify-between font-mono text-[10px] text-slate-600 shrink-0 z-10">
         <div className="flex items-center gap-3">
           <span>
-            RIG: <b className="text-slate-800">{futuristicMode ? 'CYBER-HUMANOID MK-IV' : 'HUMANOID COBOT V2'}</b>
+            RIG: <b className="text-slate-800">HUMANOID COBOT V2</b>
           </span>
           <span>
             BOUNDARY: <b className={bodyBoundaryEnabled ? 'text-emerald-700' : 'text-slate-500'}>{bodyBoundaryEnabled ? 'ENFORCED (ANTI-PENETRATION)' : 'DISABLED'}</b>
           </span>
         </div>
         <div className="flex items-center gap-3">
-          {soundEnabled && (
-            <span className="text-cyan-700 flex items-center gap-1">
-              <Volume2 className="w-3 h-3" /> SPATIAL AUDIO ACTIVE
-            </span>
-          )}
           {motionTrailsEnabled && (
             <span className="text-cyan-700 flex items-center gap-1">
               <Wind className="w-3 h-3" /> MOTION TRAILS ACTIVE

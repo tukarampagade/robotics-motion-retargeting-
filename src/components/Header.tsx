@@ -18,8 +18,6 @@ import {
   RotateCcw,
   Sliders,
   Sparkles,
-  Volume2,
-  VolumeX,
   Wind,
 } from 'lucide-react';
 import { TrackingMetrics } from '../types';
@@ -33,12 +31,12 @@ interface HeaderProps {
   hasRightHand: boolean;
   enablePickPlace: boolean;
   enableDebug: boolean;
-  soundEnabled: boolean;
+  soundEnabled?: boolean;
   showGestureGuide: boolean;
   motionTrailsEnabled: boolean;
   onTogglePickPlace: () => void;
   onToggleDebug: () => void;
-  onToggleSound: () => void;
+  onToggleSound?: () => void;
   onToggleGestureGuide: () => void;
   onToggleMotionTrails: () => void;
   onOpenSettings: () => void;
@@ -55,12 +53,10 @@ export const Header: React.FC<HeaderProps> = ({
   hasRightHand,
   enablePickPlace,
   enableDebug,
-  soundEnabled,
   showGestureGuide,
   motionTrailsEnabled,
   onTogglePickPlace,
   onToggleDebug,
-  onToggleSound,
   onToggleGestureGuide,
   onToggleMotionTrails,
   onOpenSettings,
@@ -203,27 +199,6 @@ export const Header: React.FC<HeaderProps> = ({
         >
           <Play className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">Demo</span>
-        </button>
-
-        {/* Servo Audio Toggle Button */}
-        <button
-          id="btn-toggle-sound"
-          onClick={onToggleSound}
-          className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors shadow-2xs ${
-            soundEnabled
-              ? 'bg-cyan-50 border-cyan-300 text-cyan-800'
-              : 'border-slate-200 bg-white hover:bg-slate-50 text-slate-500'
-          }`}
-          title={soundEnabled ? 'Mute spatial servo audio' : 'Enable spatial servo audio'}
-        >
-          {soundEnabled ? (
-            <Volume2 className="w-3.5 h-3.5 text-cyan-600" />
-          ) : (
-            <VolumeX className="w-3.5 h-3.5 text-slate-400" />
-          )}
-          <span className="hidden md:inline">
-            {soundEnabled ? 'Audio' : 'Muted'}
-          </span>
         </button>
 
         {/* Motion Trails Toggle Button */}

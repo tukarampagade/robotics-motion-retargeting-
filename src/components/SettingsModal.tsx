@@ -265,46 +265,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </button>
           </div>
 
-          {/* Holographic Forcefield Shield Mesh Toggle */}
-          <div className="flex items-center justify-between">
-            <div>
-              <span className="font-semibold block text-slate-800">Holographic Forcefield Shield</span>
-              <span className="text-[11px] text-slate-500">Hexagonal energy barrier with deflection ripple</span>
-            </div>
-            <button
-              onClick={() => onUpdateSettings({ showBodyBoundaryShield: !settings.showBodyBoundaryShield })}
-              className={`w-11 h-6 rounded-full transition-colors relative ${
-                settings.showBodyBoundaryShield ? 'bg-cyan-600' : 'bg-slate-300'
-              }`}
-            >
-              <span
-                className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${
-                  settings.showBodyBoundaryShield ? 'translate-x-5' : ''
-                }`}
-              />
-            </button>
-          </div>
-
-          {/* Futuristic Quantum Cyber-Core Toggle */}
-          <div className="flex items-center justify-between">
-            <div>
-              <span className="font-semibold block text-slate-800">Futuristic Cybernetic Core</span>
-              <span className="text-[11px] text-slate-500">Rotating reactor turbine, energy conduits & particle aura</span>
-            </div>
-            <button
-              onClick={() => onUpdateSettings({ futuristicMode: !settings.futuristicMode })}
-              className={`w-11 h-6 rounded-full transition-colors relative ${
-                settings.futuristicMode ? 'bg-cyan-600' : 'bg-slate-300'
-              }`}
-            >
-              <span
-                className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${
-                  settings.futuristicMode ? 'translate-x-5' : ''
-                }`}
-              />
-            </button>
-          </div>
-
           {/* Adaptive One Euro Filter Toggle */}
           <div className="flex items-center justify-between">
             <div>
@@ -326,49 +286,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
 
-        {/* 4. Spatial Servo Sound Engine */}
-        <div className="mb-5 pt-2 border-t border-slate-100">
-          <div className="flex items-center justify-between mb-2">
-            <div>
-              <span className="text-xs font-semibold block text-slate-800">Spatial Servo Audio</span>
-              <span className="text-[11px] text-slate-500">Mechanical whirring mapped to joint velocity</span>
-            </div>
-            <button
-              onClick={() => onUpdateSettings({ soundEnabled: !settings.soundEnabled })}
-              className={`w-11 h-6 rounded-full transition-colors relative ${
-                settings.soundEnabled ? 'bg-cyan-600' : 'bg-slate-300'
-              }`}
-            >
-              <span
-                className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${
-                  settings.soundEnabled ? 'translate-x-5' : ''
-                }`}
-              />
-            </button>
-          </div>
-
-          {settings.soundEnabled && (
-            <div className="mt-2 pl-1">
-              <div className="flex justify-between items-center mb-1 text-[11px]">
-                <span className="text-slate-600 font-medium">Servo Master Volume</span>
-                <span className="font-mono text-cyan-700 font-bold">
-                  {Math.round(settings.soundVolume * 100)}%
-                </span>
-              </div>
-              <input
-                type="range"
-                min="0.05"
-                max="1.0"
-                step="0.05"
-                value={settings.soundVolume}
-                onChange={e => onUpdateSettings({ soundVolume: parseFloat(e.target.value) })}
-                className="w-full accent-cyan-600 cursor-pointer"
-              />
-            </div>
-          )}
-        </div>
-
-        {/* 5. Pose Model Quality */}
+        {/* 4. Pose Model Quality */}
         <div className="mb-4 pt-2 border-t border-slate-100">
           <label className="text-xs font-semibold text-slate-700 block mb-1.5">
             Pose Model Precision

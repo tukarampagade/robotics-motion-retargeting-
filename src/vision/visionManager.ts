@@ -247,7 +247,7 @@ export class VisionManager {
     const currentPerf = performance.now();
     const videoTimeMs = Math.round(video.currentTime * 1000);
     const monotonicTimestamp = Math.max(
-      this.lastTimestampMs + 1,
+      this.lastTimestampMs + 2,
       videoTimeMs > 0 ? videoTimeMs : Math.round(currentPerf)
     );
     this.lastTimestampMs = monotonicTimestamp;
@@ -266,12 +266,13 @@ export class VisionManager {
     // 2. Detect Pose Landmarks
     let poseResults: any = null;
     try {
-      poseResults = this.poseLandmarker.detectForVideo(video, monotonicTimestamp + 0.001);
+      poseResults = this.poseLandmarker.detectForVideo(video, monotonicTimestamp + 1);
     } catch (e) {
       // Guard against momentary frame drop
     }
 
-    this.lastLatencyMs = performance.now() - startTime;
+    const inferenceLatencyMs = performance.now() - startTime;
+    this.lastLatencyMs = inferenceLatencyMs;
 
     // Measure real vision FPS
     this.visionFrameCount++;
@@ -282,6 +283,7 @@ export class VisionManager {
       this.lastFpsCalcTime = now;
     }
 
+    const kinematicsStartTime = performance.now();
     let poseLandmarks: LandmarkPoint[] | null = null;
     let handLandmarksList: LandmarkPoint[][] | null = null;
 
@@ -302,13 +304,9 @@ export class VisionManager {
         const rawLabel = handResults.handednesses?.[idx]?.[0]?.categoryName || 'Left';
         const score = handResults.handednesses?.[idx]?.[0]?.score ?? 0.8;
 
-        // MediaPipe HandLandmarker categoryName assumes selfie/mirrored webcam input.
-        // If raw unmirrored video is supplied to the model, we flip it so anatomical Left/Right is 100% correct.
-        const label: 'Left' | 'Right' = this.correctHandedness
-          ? rawLabel === 'Left'
-            ? 'Right'
-            : 'Left'
-          : (rawLabel as 'Left' | 'Right');
+        // Directly respect MediaPipe handedness label without screen position heuristics
+        // User Left Hand -> Robot Left Arm & Hand, User Right Hand -> Robot Right Arm & Hand
+        const label: 'Left' | 'Right' = rawLabel === 'Right' ? 'Right' : 'Left';
 
         // Apply Adaptive One Euro Filter to hand landmarks to suppress tracking tremor
         const lm = this.useOneEuroFilter
@@ -438,6 +436,9 @@ export class VisionManager {
     robotAngles.rWristPitch = this.rightHandState.wristOrientation.pitch;
     robotAngles.rWristYaw = this.rightHandState.wristOrientation.yaw;
 
+    const kinematicsLatencyMs = performance.now() - kinematicsStartTime;
+    const rawLandmarkLatencyMs = performance.now() - startTime;
+
     // Fire callbacks
     this.callbacks.onPoseUpdate({
       angles: robotAngles,
@@ -448,6 +449,9 @@ export class VisionManager {
         renderFps: 0, // Filled by render loop
         visionFps: this.currentVisionFps,
         latencyMs: this.lastLatencyMs,
+        rawLandmarkLatencyMs,
+        inferenceLatencyMs,
+        kinematicsLatencyMs,
         poseConfidence: poseConf,
         leftHandConfidence: lConf,
         rightHandConfidence: rConf,
@@ -467,14 +471,18 @@ export class VisionManager {
       return;
     }
     const rWrist = poseLm[16];
-    if (!rWrist) return;
+    const lWrist = poseLm[15];
+    const activeWrist = (rWrist && rWrist.visibility !== undefined && rWrist.visibility > 0.4)
+      ? rWrist
+      : lWrist;
+    if (!activeWrist) return;
 
-    this.waveHistory.push({ time: now, x: rWrist.x });
+    this.waveHistory.push({ time: now, x: activeWrist.x });
     while (this.waveHistory.length > 0 && now - this.waveHistory[0].time > 1200) {
       this.waveHistory.shift();
     }
 
-    if (this.waveHistory.length >= 7) {
+    if (this.waveHistory.length >= 6) {
       let reversals = 0;
       let dir = 0;
       let minX = 1;
@@ -491,8 +499,8 @@ export class VisionManager {
         }
       }
 
-      if (reversals >= 4 && maxX - minX > 0.08) {
-        this.waveCooldown = 45; // ~1.5s cooldown
+      if (reversals >= 3 && maxX - minX > 0.06) {
+        this.waveCooldown = 40; // ~1.3s cooldown
         this.waveHistory = [];
       }
     }

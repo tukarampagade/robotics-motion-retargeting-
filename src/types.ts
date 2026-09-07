@@ -96,6 +96,9 @@ export interface TrackingMetrics {
   renderFps: number;
   visionFps: number;
   latencyMs: number;
+  rawLandmarkLatencyMs?: number;
+  inferenceLatencyMs?: number;
+  kinematicsLatencyMs?: number;
   poseConfidence: number;
   leftHandConfidence: number;
   rightHandConfidence: number;

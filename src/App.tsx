@@ -38,7 +38,6 @@ import {
   setRetargeterBodyBoundary,
 } from './vision/motionRetargeter';
 import { DemoFrame, generateDemoSequence } from './vision/demoPlayer';
-import { ServoAudioEngine } from './audio/servoAudio';
 import { MotionTrailsManager } from './robot/motionTrails';
 import { SaccadeEngine } from './robot/saccadeEngine';
 import { Header } from './components/Header';
@@ -75,8 +74,14 @@ export default function App() {
   const robotRigRef = useRef<HumanoidRobotRig | null>(null);
   const pickPlaceStationRef = useRef<PickPlaceStation | null>(null);
   const visionManagerRef = useRef<VisionManager | null>(null);
-  const servoAudioRef = useRef<ServoAudioEngine | null>(null);
   const motionTrailsRef = useRef<MotionTrailsManager | null>(null);
+
+  // High-performance throttling refs (prevents UI re-renders on every camera frame)
+  const lastGestureRef = useRef<GestureType>('—');
+  const lastResponseRef = useRef<string>('IDLE');
+  const lastUiStateUpdateTimeRef = useRef<number>(0);
+  const lastPickPlaceStatusRef = useRef<string>('STATION READY');
+  const lastHeldObjectRef = useRef<PickableObject | null>(null);
 
   // Application State
   const [mode, setMode] = useState<'LIVE' | 'DEMO' | 'CALIBRATING'>('LIVE');
@@ -123,8 +128,8 @@ export default function App() {
     enableOneEuroFilter: true,
     studioLightingEnabled: true,
     bodyBoundaryEnabled: true,
-    showBodyBoundaryShield: true,
-    futuristicMode: true,
+    showBodyBoundaryShield: false,
+    futuristicMode: false,
     responsePreset: 'ultra_fast',
   });
 
@@ -221,12 +226,6 @@ export default function App() {
     // Build 3D hand motion trails manager
     const motionTrails = new MotionTrailsManager(env.scene);
     motionTrailsRef.current = motionTrails;
-
-    // Initialize spatial servo audio engine
-    const servoAudio = new ServoAudioEngine();
-    servoAudioRef.current = servoAudio;
-    servoAudio.setEnabled(settings.soundEnabled);
-    servoAudio.setVolume(settings.soundVolume);
 
     // Pre-generate demo sequence
     demoSequenceRef.current = generateDemoSequence();
@@ -402,14 +401,6 @@ export default function App() {
         setIsSaccadingActive(saccadeResult.isAutonomous);
       }
 
-      if (servoAudioRef.current && currentSettings.soundEnabled) {
-        servoAudioRef.current.updateVelocities({
-          leftArm: lArmVel,
-          rightArm: rArmVel,
-          head: headVel,
-        });
-      }
-
       // Copy current angles to prevAnglesRef
       Object.keys(cur).forEach(k => {
         const key = k as keyof RobotJointAngles;
@@ -480,8 +471,14 @@ export default function App() {
             isRightGrip
           );
 
-          setPickPlaceStatus(res.statusText);
-          setHeldObject(res.heldObject);
+          if (lastPickPlaceStatusRef.current !== res.statusText) {
+            lastPickPlaceStatusRef.current = res.statusText;
+            setPickPlaceStatus(res.statusText);
+          }
+          if (lastHeldObjectRef.current !== res.heldObject) {
+            lastHeldObjectRef.current = res.heldObject;
+            setHeldObject(res.heldObject);
+          }
           if (res.justPlaced) {
             setPlacedCount(c => c + 1);
           }
@@ -515,7 +512,6 @@ export default function App() {
       clearInterval(fpsMeterInterval);
       resizeObserver.disconnect();
       motionTrails.dispose();
-      servoAudio.destroy();
     };
   }, [mode]);
 
@@ -527,40 +523,56 @@ export default function App() {
       onPoseUpdate: data => {
         if (mode === 'DEMO') return;
 
-        // Apply new target joint angles
+        // Apply new target joint angles directly to mutable refs (zero React lag)
         targetAnglesRef.current = data.angles;
         targetLeftFingersRef.current = data.leftHand.fingers;
         targetRightFingersRef.current = data.rightHand.fingers;
 
-        setLeftHandState(data.leftHand);
-        setRightHandState(data.rightHand);
-        setCurrentGesture(data.gesture);
-
-        // State label
+        // Determine state label
+        let nextResponse = 'STANDBY';
         if (data.gesture === 'WAVE') {
-          setRobotResponseState('WAVING GREETING');
+          nextResponse = 'WAVING GREETING';
         } else if (data.gesture === 'THUMBS_UP') {
-          setRobotResponseState('ACKNOWLEDGING');
+          nextResponse = 'ACKNOWLEDGING';
         } else if (data.gesture === 'PINCH' || data.gesture === 'FIST') {
-          setRobotResponseState('PRECISION GRIP');
+          nextResponse = 'PRECISION GRIP';
         } else if (data.gesture === 'VICTORY') {
-          setRobotResponseState('VICTORY SIGN');
+          nextResponse = 'VICTORY SIGN';
         } else if (data.metrics.poseConfidence > 0.4) {
-          setRobotResponseState('MIRRORING');
-        } else {
-          setRobotResponseState('STANDBY');
+          nextResponse = 'MIRRORING';
         }
 
-        setMetrics(prev => ({
-          ...prev,
-          visionFps: data.metrics.visionFps,
-          latencyMs: data.metrics.latencyMs,
-          poseConfidence: data.metrics.poseConfidence,
-          leftHandConfidence: data.metrics.leftHandConfidence,
-          rightHandConfidence: data.metrics.rightHandConfidence,
-          faceConfidence: data.metrics.faceConfidence,
-          activeArmSource: data.metrics.activeArmSource,
-        }));
+        // Only trigger React state updates when state/gesture actually changes
+        if (lastGestureRef.current !== data.gesture) {
+          lastGestureRef.current = data.gesture;
+          setCurrentGesture(data.gesture);
+        }
+        if (lastResponseRef.current !== nextResponse) {
+          lastResponseRef.current = nextResponse;
+          setRobotResponseState(nextResponse);
+        }
+
+        // Throttle UI metrics and hand tracking state updates to 10 Hz (every 100ms)
+        const now = performance.now();
+        if (now - lastUiStateUpdateTimeRef.current >= 100) {
+          lastUiStateUpdateTimeRef.current = now;
+          setLeftHandState(data.leftHand);
+          setRightHandState(data.rightHand);
+          setMetrics(prev => ({
+            ...prev,
+            visionFps: data.metrics.visionFps,
+            latencyMs: data.metrics.latencyMs,
+            rawLandmarkLatencyMs: data.metrics.rawLandmarkLatencyMs,
+            inferenceLatencyMs: data.metrics.inferenceLatencyMs,
+            kinematicsLatencyMs: data.metrics.kinematicsLatencyMs,
+            poseConfidence: data.metrics.poseConfidence,
+            leftHandConfidence: data.metrics.leftHandConfidence,
+            rightHandConfidence: data.metrics.rightHandConfidence,
+            faceConfidence: data.metrics.faceConfidence,
+            activeArmSource: data.metrics.activeArmSource,
+            boundaryDeflected: data.metrics.boundaryDeflected,
+          }));
+        }
 
         // Handle calibration sampling
         if (calibration.isCalibrating && data.metrics.poseConfidence > 0.5) {
@@ -683,9 +695,6 @@ export default function App() {
       setIsCameraActive(true);
       setMode('LIVE');
 
-      // Initialize audio context on user action
-      servoAudioRef.current?.init();
-
       // Start asynchronous, non-blocking vision loop
       visionManagerRef.current.start(video);
     } catch (err: any) {
@@ -704,23 +713,12 @@ export default function App() {
 
   // Switch to Demo Mode
   const handleToggleDemo = () => {
-    servoAudioRef.current?.init();
     if (mode === 'DEMO') {
       setMode('LIVE');
     } else {
       setMode('DEMO');
       demoStartTimeRef.current = performance.now();
     }
-  };
-
-  // Toggle Spatial Servo Audio
-  const handleToggleSound = () => {
-    servoAudioRef.current?.init();
-    setSettings(s => {
-      const next = !s.soundEnabled;
-      servoAudioRef.current?.setEnabled(next);
-      return { ...s, soundEnabled: next };
-    });
   };
 
   // Toggle 3D Hand Motion Trails
@@ -759,10 +757,8 @@ export default function App() {
         hasRightHand={rightHandState.detected}
         enablePickPlace={settings.enablePickPlace}
         enableDebug={isDebugOpen}
-        soundEnabled={settings.soundEnabled}
         motionTrailsEnabled={settings.motionTrailsEnabled}
         showGestureGuide={settings.showGestureGuide}
-        onToggleSound={handleToggleSound}
         onToggleMotionTrails={handleToggleMotionTrails}
         onToggleGestureGuide={handleToggleGestureGuide}
         onTogglePickPlace={() => setIsPickPlacePanelOpen(v => !v)}
@@ -802,7 +798,6 @@ export default function App() {
             heldObject={heldObject}
             placedCount={placedCount}
             showGestureGuide={settings.showGestureGuide}
-            soundEnabled={settings.soundEnabled}
             motionTrailsEnabled={settings.motionTrailsEnabled}
             studioLightingEnabled={settings.studioLightingEnabled}
             bodyBoundaryEnabled={settings.bodyBoundaryEnabled}
@@ -817,7 +812,6 @@ export default function App() {
             }}
             onResetPickPlace={() => pickPlaceStationRef.current?.resetObjects()}
             onToggleGestureGuide={handleToggleGestureGuide}
-            onToggleSound={handleToggleSound}
             onToggleMotionTrails={handleToggleMotionTrails}
             onToggleStudioLighting={() =>
               setSettings(s => ({ ...s, studioLightingEnabled: !s.studioLightingEnabled }))
@@ -891,12 +885,6 @@ export default function App() {
         onUpdateSettings={updates => {
           setSettings(s => {
             const next = { ...s, ...updates };
-            if (updates.soundEnabled !== undefined && servoAudioRef.current) {
-              servoAudioRef.current.setEnabled(updates.soundEnabled);
-            }
-            if (updates.soundVolume !== undefined && servoAudioRef.current) {
-              servoAudioRef.current.setVolume(updates.soundVolume);
-            }
             if (updates.enableSaccades !== undefined) {
               saccadeEngineRef.current.setEnabled(updates.enableSaccades);
             }
