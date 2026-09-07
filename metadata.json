@@ -1,0 +1,10 @@
+{
+  "name": "MotionMirror AI",
+  "description": "Real-time webcam humanoid robot motion mirroring with articulated half-body robotics, finger tracking, and interactive pick & place station.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
