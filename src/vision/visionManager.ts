@@ -93,9 +93,14 @@ export class VisionManager {
   private poseFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.3, 0.065);
   private leftHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.5, 0.075);
   private rightHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.5, 0.075);
+  private poseConfidenceThreshold: number = 0.25;
 
   constructor(callbacks: VisionCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public setPoseConfidenceThreshold(th: number) {
+    this.poseConfidenceThreshold = Math.max(0.05, Math.min(0.95, th));
   }
 
   public setUseOneEuroFilter(enable: boolean) {
@@ -121,7 +126,7 @@ export class VisionManager {
     }
   }
 
-  public async initialize(quality: 'full' | 'lite' = 'full'): Promise<void> {
+  public async initialize(quality: 'full' | 'lite' = 'lite'): Promise<void> {
     this.poseQuality = quality;
     try {
       this.visionResolver = await FilesetResolver.forVisionTasks(
@@ -140,9 +145,9 @@ export class VisionManager {
         },
         runningMode: 'VIDEO',
         numPoses: 1,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minPoseDetectionConfidence: 0.35,
+        minPosePresenceConfidence: 0.35,
+        minTrackingConfidence: 0.35,
       });
 
       this.handLandmarker = await HandLandmarker.createFromOptions(this.visionResolver, {
@@ -153,9 +158,9 @@ export class VisionManager {
         },
         runningMode: 'VIDEO',
         numHands: 2,
-        minHandDetectionConfidence: 0.5,
-        minHandPresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minHandDetectionConfidence: 0.25,
+        minHandPresenceConfidence: 0.25,
+        minTrackingConfidence: 0.25,
       });
     } catch (err: any) {
       console.error('Failed to initialize MediaPipe models:', err);
@@ -184,41 +189,32 @@ export class VisionManager {
     this.lastTimestampMs = 0;
     this.lastVideoTime = -1;
 
-    const executeFrame = async () => {
+    let lastRunTime = 0;
+
+    const executeFrame = async (timestamp: number) => {
       if (!this.isRunning) return;
 
-      if (!this.isProcessing && videoElement.readyState >= 2 && !videoElement.paused) {
-        if (videoElement.currentTime !== this.lastVideoTime) {
-          this.lastVideoTime = videoElement.currentTime;
-          this.isProcessing = true;
-          try {
-            await this.processVideoFrame(videoElement);
-          } catch (err) {
-            console.warn('Vision frame processing glitch caught safely:', err);
-          } finally {
-            this.isProcessing = false;
-          }
+      const elapsed = timestamp - lastRunTime;
+      const targetInterval = this.targetIntervalMs;
+
+      if (!this.isProcessing && videoElement.readyState >= 2 && !videoElement.paused && elapsed >= targetInterval) {
+        lastRunTime = timestamp;
+        this.isProcessing = true;
+        try {
+          await this.processVideoFrame(videoElement);
+        } catch (err) {
+          console.warn('Vision frame processing glitch caught safely:', err);
+        } finally {
+          this.isProcessing = false;
         }
       }
 
       if (this.isRunning) {
-        if (this.targetIntervalMs === 0 && 'requestVideoFrameCallback' in videoElement) {
-          (videoElement as any).requestVideoFrameCallback(executeFrame);
-        } else if (this.targetIntervalMs > 0) {
-          this.visionIntervalId = window.setTimeout(executeFrame, this.targetIntervalMs);
-        } else {
-          this.animationFrameId = requestAnimationFrame(executeFrame);
-        }
+        this.animationFrameId = requestAnimationFrame(executeFrame);
       }
     };
 
-    if (this.targetIntervalMs === 0 && 'requestVideoFrameCallback' in videoElement) {
-      (videoElement as any).requestVideoFrameCallback(executeFrame);
-    } else if (this.targetIntervalMs > 0) {
-      this.visionIntervalId = window.setTimeout(executeFrame, this.targetIntervalMs);
-    } else {
-      this.animationFrameId = requestAnimationFrame(executeFrame);
-    }
+    this.animationFrameId = requestAnimationFrame(executeFrame);
   }
 
   public stop(): void {
@@ -296,17 +292,73 @@ export class VisionManager {
     let rConf = 0;
     let detectedGesture: GestureType = 'MIRRORING';
 
-    // Parse Hands
+    // Parse Hands with robust handedness resolution
     if (handResults && handResults.landmarks && handResults.landmarks.length > 0) {
       const filteredHands: LandmarkPoint[][] = [];
+
+      // -------------------------------------------------------------
+      // EXPLICIT LEFT / RIGHT INPUT STREAM DISAMBIGUATION
+      // -------------------------------------------------------------
+      // Bypasses naive horizontal sorting to prevent cross-body mirroring errors.
+      // Evaluates 3D proximity to the pose arm kinematic chain (wrist, elbow, shoulder).
+      const pLm = (poseResults && poseResults.landmarks && poseResults.landmarks[0]) || null;
+      const assignedLabels: ('Left' | 'Right')[] = [];
+
+      const calcArmProximityCost = (handWrist: LandmarkPoint, armSide: 'Left' | 'Right'): number => {
+        if (!pLm) {
+          // Camera frame fallback without pose: user's Left is on right side of image (x > 0.5)
+          return armSide === 'Left' ? (handWrist.x > 0.5 ? 0.1 : 0.9) : (handWrist.x <= 0.5 ? 0.1 : 0.9);
+        }
+        const shoulder = armSide === 'Left' ? pLm[11] : pLm[12];
+        const elbow = armSide === 'Left' ? pLm[13] : pLm[14];
+        const poseWrist = armSide === 'Left' ? pLm[15] : pLm[16];
+
+        const distWrist = poseWrist && (poseWrist.visibility ?? 0) > 0.25
+          ? Math.hypot(handWrist.x - poseWrist.x, handWrist.y - poseWrist.y)
+          : 0.5;
+        const distElbow = elbow && (elbow.visibility ?? 0) > 0.25
+          ? Math.hypot(handWrist.x - elbow.x, handWrist.y - elbow.y)
+          : 0.7;
+        const distShoulder = shoulder && (shoulder.visibility ?? 0) > 0.25
+          ? Math.hypot(handWrist.x - shoulder.x, handWrist.y - shoulder.y)
+          : 0.9;
+
+        // Weight wrist proximity highest, then elbow chain continuity
+        return distWrist * 2.0 + distElbow * 0.8 + distShoulder * 0.3;
+      };
+
+      if (handResults.landmarks.length === 1) {
+        const wrist0 = handResults.landmarks[0][0];
+        const rawLabel0 = handResults.handednesses?.[0]?.[0]?.categoryName;
+        const costLeft = calcArmProximityCost(wrist0, 'Left') + (rawLabel0 === 'Right' ? 0.3 : 0.0);
+        const costRight = calcArmProximityCost(wrist0, 'Right') + (rawLabel0 === 'Left' ? 0.3 : 0.0);
+        assignedLabels.push(costLeft <= costRight ? 'Left' : 'Right');
+      } else if (handResults.landmarks.length >= 2) {
+        const wrist0 = handResults.landmarks[0][0];
+        const wrist1 = handResults.landmarks[1][0];
+        const rawLabel0 = handResults.handednesses?.[0]?.[0]?.categoryName;
+        const rawLabel1 = handResults.handednesses?.[1]?.[0]?.categoryName;
+
+        // Pairwise Hungarian assignment to find global optimal arm stream mapping
+        const cost0L = calcArmProximityCost(wrist0, 'Left') + (rawLabel0 === 'Right' ? 0.3 : 0.0);
+        const cost1R = calcArmProximityCost(wrist1, 'Right') + (rawLabel1 === 'Left' ? 0.3 : 0.0);
+
+        const cost0R = calcArmProximityCost(wrist0, 'Right') + (rawLabel0 === 'Left' ? 0.3 : 0.0);
+        const cost1L = calcArmProximityCost(wrist1, 'Left') + (rawLabel1 === 'Right' ? 0.3 : 0.0);
+
+        if (cost0L + cost1R <= cost0R + cost1L) {
+          assignedLabels[0] = 'Left';
+          assignedLabels[1] = 'Right';
+        } else {
+          assignedLabels[0] = 'Right';
+          assignedLabels[1] = 'Left';
+        }
+      }
 
       handResults.landmarks.forEach((rawLm: LandmarkPoint[], idx: number) => {
         const rawLabel = handResults.handednesses?.[idx]?.[0]?.categoryName || 'Left';
         const score = handResults.handednesses?.[idx]?.[0]?.score ?? 0.8;
-
-        // Directly respect MediaPipe handedness label without screen position heuristics
-        // User Left Hand -> Robot Left Arm & Hand, User Right Hand -> Robot Right Arm & Hand
-        const label: 'Left' | 'Right' = rawLabel === 'Right' ? 'Right' : 'Left';
+        const label: 'Left' | 'Right' = assignedLabels[idx] || (rawLabel === 'Right' ? 'Right' : 'Left');
 
         // Apply Adaptive One Euro Filter to hand landmarks to suppress tracking tremor
         const lm = this.useOneEuroFilter
@@ -365,17 +417,27 @@ export class VisionManager {
 
     // Decay hand states smoothly when tracking is lost during fast motion blur
     if (!lHandDetected) {
-      this.leftHandState.confidence *= 0.85;
-      if (this.leftHandState.confidence < 0.15) {
+      this.leftHandState.confidence *= 0.88;
+      if (this.leftHandState.confidence < 0.20) {
         this.leftHandState.detected = false;
         this.leftHandFilter.reset();
+        (['thumb', 'index', 'middle', 'ring', 'pinky'] as const).forEach(f => {
+          this.leftHandState.fingers[f].mcp *= 0.85;
+          this.leftHandState.fingers[f].pip *= 0.85;
+          this.leftHandState.fingers[f].dip *= 0.85;
+        });
       }
     }
     if (!rHandDetected) {
-      this.rightHandState.confidence *= 0.85;
-      if (this.rightHandState.confidence < 0.15) {
+      this.rightHandState.confidence *= 0.88;
+      if (this.rightHandState.confidence < 0.20) {
         this.rightHandState.detected = false;
         this.rightHandFilter.reset();
+        (['thumb', 'index', 'middle', 'ring', 'pinky'] as const).forEach(f => {
+          this.rightHandState.fingers[f].mcp *= 0.85;
+          this.rightHandState.fingers[f].pip *= 0.85;
+          this.rightHandState.fingers[f].dip *= 0.85;
+        });
       }
     }
 
@@ -406,7 +468,8 @@ export class VisionManager {
         leftFusedWrist,
         rightFusedWrist,
         this.motionGain,
-        worldPoseLandmarks
+        worldPoseLandmarks,
+        monotonicTimestamp
       );
 
       Object.assign(robotAngles, retargeted);
@@ -472,17 +535,34 @@ export class VisionManager {
     }
     const rWrist = poseLm[16];
     const lWrist = poseLm[15];
-    const activeWrist = (rWrist && rWrist.visibility !== undefined && rWrist.visibility > 0.4)
-      ? rWrist
-      : lWrist;
-    if (!activeWrist) return;
+    const rShoulder = poseLm[12];
+    const lShoulder = poseLm[11];
+
+    // Detect if either wrist is raised up (y < shoulder.y)
+    const rRaised = rWrist && rShoulder && rWrist.y < rShoulder.y + 0.05;
+    const lRaised = lWrist && lShoulder && lWrist.y < lShoulder.y + 0.05;
+
+    let activeWrist: LandmarkPoint | null = null;
+    if (rRaised && !lRaised) {
+      activeWrist = rWrist;
+    } else if (lRaised && !rRaised) {
+      activeWrist = lWrist;
+    } else if (rRaised && lRaised) {
+      // Pick higher wrist
+      activeWrist = rWrist.y < lWrist.y ? rWrist : lWrist;
+    }
+
+    if (!activeWrist) {
+      this.waveHistory = [];
+      return;
+    }
 
     this.waveHistory.push({ time: now, x: activeWrist.x });
     while (this.waveHistory.length > 0 && now - this.waveHistory[0].time > 1200) {
       this.waveHistory.shift();
     }
 
-    if (this.waveHistory.length >= 6) {
+    if (this.waveHistory.length >= 5) {
       let reversals = 0;
       let dir = 0;
       let minX = 1;
@@ -499,8 +579,8 @@ export class VisionManager {
         }
       }
 
-      if (reversals >= 3 && maxX - minX > 0.06) {
-        this.waveCooldown = 40; // ~1.3s cooldown
+      if (reversals >= 2 && maxX - minX > 0.05) {
+        this.waveCooldown = 35; // ~1s cooldown
         this.waveHistory = [];
       }
     }

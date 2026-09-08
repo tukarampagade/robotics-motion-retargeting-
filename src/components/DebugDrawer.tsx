@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
-import { Activity, Layers, X } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Activity, Layers, X, Cpu } from 'lucide-react';
 import {
   HandTrackingState,
   RobotJointAngles,
@@ -30,6 +30,26 @@ export const DebugDrawer: React.FC<DebugDrawerProps> = ({
 }) => {
   if (!isOpen) return null;
 
+  const [enableLogging, setEnableLogging] = useState<boolean>(false);
+  const lastLogTimeRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!enableLogging) return;
+    const now = performance.now();
+    if (now - lastLogTimeRef.current >= 1000) {
+      lastLogTimeRef.current = now;
+      console.log('[Motion Pipeline Latency]', {
+        rawLandmarkLatencyMs: Number(metrics.rawLandmarkLatencyMs?.toFixed(2) ?? 0),
+        inferenceLatencyMs: Number(metrics.inferenceLatencyMs?.toFixed(2) ?? 0),
+        kinematicsLatencyMs: Number(metrics.kinematicsLatencyMs?.toFixed(2) ?? 0),
+        visionFps: metrics.visionFps,
+        poseConfidence: Number((metrics.poseConfidence * 100).toFixed(1)),
+        activeArmLeft: metrics.activeArmSource.left,
+        activeArmRight: metrics.activeArmSource.right,
+      });
+    }
+  }, [enableLogging, metrics]);
+
   const toDeg = (rad: number) => Math.round((rad * 180) / Math.PI);
 
   return (
@@ -41,7 +61,7 @@ export const DebugDrawer: React.FC<DebugDrawerProps> = ({
           </div>
           <div>
             <h3 className="text-xs font-bold text-slate-900">Live Telemetry Inspector</h3>
-            <p className="text-[10px] text-slate-500">Real-time Kinematics & Tracking</p>
+            <p className="text-[10px] text-slate-500">Real-time Kinematics & Pipeline Diagnostics</p>
           </div>
         </div>
 
@@ -51,6 +71,57 @@ export const DebugDrawer: React.FC<DebugDrawerProps> = ({
         >
           <X className="w-4 h-4" />
         </button>
+      </div>
+
+      {/* Motion Pipeline Latency & Diagnostic Logging */}
+      <div className="mb-3 p-2.5 rounded-xl bg-slate-900 text-slate-100 border border-slate-800 shadow-xs">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-[10px] font-bold text-cyan-400 uppercase tracking-wide flex items-center gap-1.5">
+            <Cpu className="w-3.5 h-3.5 text-cyan-400" />
+            PIPELINE LATENCY DIAGNOSTICS
+          </span>
+          <label className="flex items-center gap-1.5 text-[10px] text-slate-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={enableLogging}
+              onChange={e => setEnableLogging(e.target.checked)}
+              className="w-3.5 h-3.5 accent-cyan-500 rounded cursor-pointer"
+            />
+            <span>Diagnostic Log</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 text-[11px] mb-2 font-mono">
+          <div className="p-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+            <span className="text-[9.5px] text-slate-400 block">Raw Landmark Latency</span>
+            <b className="text-cyan-300 text-xs">{metrics.rawLandmarkLatencyMs?.toFixed(1) ?? '—'} ms</b>
+            <span className="text-[8.5px] text-slate-500 block">Capture → Robot Target</span>
+          </div>
+
+          <div className="p-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+            <span className="text-[9.5px] text-slate-400 block">Model Inference</span>
+            <b className="text-emerald-400 text-xs">{metrics.inferenceLatencyMs?.toFixed(1) ?? '—'} ms</b>
+            <span className="text-[8.5px] text-slate-500 block">MediaPipe GPU Pass</span>
+          </div>
+
+          <div className="p-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+            <span className="text-[9.5px] text-slate-400 block">IK & Retargeting</span>
+            <b className="text-indigo-300 text-xs">{metrics.kinematicsLatencyMs?.toFixed(1) ?? '—'} ms</b>
+            <span className="text-[8.5px] text-slate-500 block">Analytical IK Solve</span>
+          </div>
+
+          <div className="p-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60">
+            <span className="text-[9.5px] text-slate-400 block">Vision Rate</span>
+            <b className="text-amber-300 text-xs">{metrics.visionFps} FPS</b>
+            <span className="text-[8.5px] text-slate-500 block">Capture Throughput</span>
+          </div>
+        </div>
+
+        <div className="pt-1.5 border-t border-slate-800 flex justify-between text-[10px] text-slate-400">
+          <span>Pose Conf: <b className="text-slate-200">{Math.round(metrics.poseConfidence * 100)}%</b></span>
+          <span>L-Arm: <b className="text-cyan-400">{metrics.activeArmSource.left}</b></span>
+          <span>R-Arm: <b className="text-cyan-400">{metrics.activeArmSource.right}</b></span>
+        </div>
       </div>
 
       {/* Head & Gaze */}

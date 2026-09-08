@@ -159,4 +159,6 @@ export interface AppSettings {
   showBodyBoundaryShield: boolean;
   futuristicMode: boolean;
   responsePreset: 'ultra_fast' | 'balanced' | 'cinematic';
+  poseConfidenceThreshold: number;
+  showLatencyDiagnostics: boolean;
 }

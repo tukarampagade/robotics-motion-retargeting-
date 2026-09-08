@@ -108,6 +108,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           />
         </div>
 
+        {/* 2.5 Pose Confidence Threshold for Motion Triggering */}
+        <div className="mb-5 pt-3 border-t border-slate-100">
+          <div className="flex justify-between items-center mb-1">
+            <label className="text-xs font-semibold text-slate-700">
+              Pose Confidence Threshold
+            </label>
+            <span className="font-mono text-xs text-cyan-700 font-bold">
+              {((settings.poseConfidenceThreshold ?? 0.25) * 100).toFixed(0)}% ({(settings.poseConfidenceThreshold ?? 0.25).toFixed(2)})
+            </span>
+          </div>
+          <p className="text-[11px] text-slate-500 mb-2.5">
+            Sensitivity threshold for triggering robot motion. Lower this in dim or non-ideal lighting conditions so arm motion triggers reliably.
+          </p>
+          <div className="grid grid-cols-3 gap-2 mb-2 font-mono text-xs">
+            {[
+              { label: 'DIM LIGHT (15%)', val: 0.15 },
+              { label: 'BALANCED (25%)', val: 0.25 },
+              { label: 'STRICT (40%)', val: 0.40 },
+            ].map(item => (
+              <button
+                key={item.label}
+                onClick={() => onUpdateSettings({ poseConfidenceThreshold: item.val })}
+                className={`py-1.5 rounded-lg border text-center transition-all ${
+                  Math.abs((settings.poseConfidenceThreshold ?? 0.25) - item.val) < 0.03
+                    ? 'border-cyan-600 bg-cyan-50 text-cyan-800 font-bold shadow-2xs'
+                    : 'border-slate-200 hover:border-slate-300 text-slate-600'
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <input
+            type="range"
+            min="0.10"
+            max="0.80"
+            step="0.05"
+            value={settings.poseConfidenceThreshold ?? 0.25}
+            onChange={e => onUpdateSettings({ poseConfidenceThreshold: parseFloat(e.target.value) })}
+            className="w-full accent-cyan-600 cursor-pointer"
+          />
+          <div className="flex justify-between text-[10px] text-slate-400 font-mono mt-1">
+            <span>10% (High Sensitivity / Dim Lighting)</span>
+            <span>80% (Strict Studio Lighting)</span>
+          </div>
+        </div>
+
         {/* 3. Toggles */}
         <div className="space-y-3 pt-2 border-t border-slate-100 mb-5 text-xs">
           <div className="flex items-center justify-between">

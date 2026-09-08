@@ -354,7 +354,8 @@ function computeIndependentFingerCurls(
 
   // Calculate bend angles directly using vectors:
   // Angle between bone segments: straight = 0 rad, bent 90 deg = 1.57 rad
-  const mcpAngle = angleBetweenVectors(vWristMcp, vMcpPip);
+  // Baseline knuckle angle offset from wrist-mcp line is ~0.20 rad
+  const rawMcpAngle = Math.max(0, angleBetweenVectors(vWristMcp, vMcpPip) - 0.20);
   const pipAngle = angleBetweenVectors(vMcpPip, vPipDip);
   const dipAngle = angleBetweenVectors(vPipDip, vDipTip);
 
@@ -364,21 +365,21 @@ function computeIndependentFingerCurls(
   const l2 = Math.hypot(vPipDip.x, vPipDip.y, vPipDip.z);
   const l3 = Math.hypot(vDipTip.x, vDipTip.y, vDipTip.z);
   const totalLen = Math.max(1e-4, l1 + l2 + l3);
-  const contraction = clamp((0.92 - tipSpan / totalLen) / 0.58, 0.0, 1.0);
+  const contraction = clamp((0.90 - tipSpan / totalLen) / 0.55, 0.0, 1.0);
 
   // Blend direct vector angles with contraction for maximum responsiveness
   const mcpCurl = clamp(
-    Math.max(mcpAngle * 1.15, contraction * ROBOT_LIMITS.fingerMcp[1] * 0.92),
+    Math.max(rawMcpAngle * 1.3, contraction * ROBOT_LIMITS.fingerMcp[1]),
     ROBOT_LIMITS.fingerMcp[0],
     ROBOT_LIMITS.fingerMcp[1]
   );
   const pipCurl = clamp(
-    Math.max(pipAngle * 1.2, contraction * ROBOT_LIMITS.fingerPip[1] * 0.95),
+    Math.max(pipAngle * 1.25, contraction * ROBOT_LIMITS.fingerPip[1]),
     ROBOT_LIMITS.fingerPip[0],
     ROBOT_LIMITS.fingerPip[1]
   );
   const dipCurl = clamp(
-    Math.max(dipAngle * 1.15, contraction * ROBOT_LIMITS.fingerDip[1] * 0.88),
+    Math.max(dipAngle * 1.2, contraction * ROBOT_LIMITS.fingerDip[1]),
     ROBOT_LIMITS.fingerDip[0],
     ROBOT_LIMITS.fingerDip[1]
   );
@@ -405,7 +406,7 @@ function computeIndependentThumb(
   const vIpTip = { x: tip.x - ip.x, y: tip.y - ip.y, z: (tip.z ?? 0) - (ip.z ?? 0) };
 
   // Thumb MCP bend: angle between CMC->MCP and MCP->IP
-  const mcpBend = angleBetweenVectors(vCmcMcp, vMcpIp);
+  const mcpBend = Math.max(0, angleBetweenVectors(vCmcMcp, vMcpIp) - 0.15);
   // Thumb IP bend: angle between MCP->IP and IP->TIP
   const ipBend = angleBetweenVectors(vMcpIp, vIpTip);
 
@@ -413,20 +414,20 @@ function computeIndependentThumb(
   const idxMcp = landmarks[5];
   const palmScale = Math.hypot(landmarks[9].x - w.x, landmarks[9].y - w.y) || 0.1;
   const oppDist = Math.hypot(tip.x - idxMcp.x, tip.y - idxMcp.y) / palmScale;
-  const oppCurl = clamp((1.35 - oppDist) / 0.85, 0.0, 1.0);
+  const oppCurl = clamp((1.30 - oppDist) / 0.75, 0.0, 1.0);
 
   const mcpCurl = clamp(
-    Math.max(mcpBend * 1.25, oppCurl * ROBOT_LIMITS.fingerMcp[1] * 0.90),
+    Math.max(mcpBend * 1.35, oppCurl * ROBOT_LIMITS.fingerMcp[1]),
     ROBOT_LIMITS.fingerMcp[0],
     ROBOT_LIMITS.fingerMcp[1]
   );
   const pipCurl = clamp(
-    Math.max(ipBend * 1.3, oppCurl * ROBOT_LIMITS.fingerPip[1] * 0.92),
+    Math.max(ipBend * 1.35, oppCurl * ROBOT_LIMITS.fingerPip[1]),
     ROBOT_LIMITS.fingerPip[0],
     ROBOT_LIMITS.fingerPip[1]
   );
   const dipCurl = clamp(
-    Math.max(ipBend * 0.85, oppCurl * ROBOT_LIMITS.fingerDip[1] * 0.82),
+    Math.max(ipBend * 0.95, oppCurl * ROBOT_LIMITS.fingerDip[1]),
     ROBOT_LIMITS.fingerDip[0],
     ROBOT_LIMITS.fingerDip[1]
   );
@@ -506,8 +507,14 @@ export function analyzeHandLandmarks(
   );
 
   // Gesture classification
-  const palmSize = Math.hypot(landmarks[0].x - landmarks[9].x, landmarks[0].y - landmarks[9].y) || 0.001;
-  const pinchDist = Math.hypot(landmarks[4].x - landmarks[8].x, landmarks[4].y - landmarks[8].y) / palmSize;
+  const palmSize = Math.max(0.04, alongMag);
+
+  // 3D pinch distance (thumb tip 4 to index tip 8) normalized by palm size
+  const pinchDist = Math.hypot(
+    landmarks[4].x - landmarks[8].x,
+    landmarks[4].y - landmarks[8].y,
+    ((landmarks[4].z ?? 0) - (landmarks[8].z ?? 0)) * 1.5
+  ) / palmSize;
 
   const isExtended = (f: keyof HandFingersState) => fingers[f].mcp < 0.42;
   const isCurled = (f: keyof HandFingersState) => fingers[f].mcp > 0.68;
@@ -527,7 +534,7 @@ export function analyzeHandLandmarks(
       gesture = 'FIST';
       isGrip = true;
     }
-  } else if (pinchDist < 0.38) {
+  } else if (pinchDist < 0.25) {
     gesture = 'PINCH';
     isGrip = true;
   } else if (isExtended('index') && isCurled('middle') && isCurled('ring') && isCurled('pinky')) {
@@ -562,7 +569,8 @@ export function retargetHumanPose(
   leftFusedWrist: LandmarkPoint | null,
   rightFusedWrist: LandmarkPoint | null,
   motionGain: number = 1.0,
-  worldLandmarks?: LandmarkPoint[]
+  worldLandmarks?: LandmarkPoint[],
+  timestampMs?: number
 ): Partial<RobotJointAngles> & {
   activeArmSource: { left: 'HAND' | 'POSE' | 'NONE'; right: 'HAND' | 'POSE' | 'NONE' };
   ikMetrics?: {
@@ -576,6 +584,10 @@ export function retargetHumanPose(
     rightDeflected: boolean;
     leftPenetration: number;
     rightPenetration: number;
+  };
+  jointVelocities?: {
+    left?: import('../robot/robotModel').ArmJointVelocities;
+    right?: import('../robot/robotModel').ArmJointVelocities;
   };
 } {
   const nose = poseLandmarks[0];
@@ -592,23 +604,50 @@ export function retargetHumanPose(
   const shoulderMidY = (lShoulder.y + rShoulder.y) / 2;
   const hipMidX = lHip && rHip ? (lHip.x + rHip.x) / 2 : shoulderMidX;
 
-  // Head Yaw, Pitch & Roll
+  // ------------------------------------------------------------------------
+  // HEAD TRACKING (YAW, PITCH, ROLL & EYE GAZE) - ACCURATE BIOMECHANICAL ANALYSIS
+  // ------------------------------------------------------------------------
+  const eyeL = poseLandmarks[2] || poseLandmarks[0];
+  const eyeR = poseLandmarks[5] || poseLandmarks[0];
+  const earL = poseLandmarks[7];
+  const earR = poseLandmarks[8];
+
+  // Head Roll:
+  // In camera view, eyeL is on the right side of the image (larger X, e.g. ~0.53).
+  // eyeR is on the left side of the image (smaller X, e.g. ~0.47).
+  // dEyeX = eyeL.x - eyeR.x is strictly POSITIVE.
+  // When head is upright: eyeL.y - eyeR.y = 0 -> atan2(0, positive) = 0 radians!
+  const dEyeX = eyeL.x - eyeR.x;
+  const dEyeY = eyeL.y - eyeR.y;
+  const rawRoll = Math.abs(dEyeX) > 0.01 ? Math.atan2(dEyeY, dEyeX) : 0;
+  const headRoll = clamp(rawRoll * motionGain, ROBOT_LIMITS.neckRoll[0], ROBOT_LIMITS.neckRoll[1]);
+
+  // Head Yaw:
+  // Use bilateral facial center between ears or eyes to eliminate shoulder posture dependency.
+  const hasEars = earL && earR && (earL.visibility ?? 0) > 0.35 && (earR.visibility ?? 0) > 0.35;
+  const faceCenterX = hasEars ? (earL.x + earR.x) * 0.5 : (eyeL.x + eyeR.x) * 0.5;
+  const faceSpan = Math.max(0.04, Math.abs(dEyeX) * 2.2);
+  const yawOffset = (faceCenterX - nose.x) / faceSpan;
   const headYaw = clamp(
-    (shoulderMidX - nose.x) * 2.2 * motionGain,
+    yawOffset * 1.5 * motionGain,
     ROBOT_LIMITS.neckYaw[0],
     ROBOT_LIMITS.neckYaw[1]
   );
+
+  // Head Pitch:
+  // Compare nose elevation to eye/ear horizontal baseline.
+  // In screen coords, Y increases downwards. When user looks UP, nose moves up (nose.y decreases).
+  // When user looks DOWN, nose moves down (nose.y increases).
+  const eyeMidY = (eyeL.y + eyeR.y) * 0.5;
+  const earMidY = hasEars ? (earL.y + earR.y) * 0.5 : eyeMidY;
+  const faceBaselineY = (eyeMidY + earMidY) * 0.5;
+  const faceHeight = Math.max(0.05, Math.abs(shoulderMidY - eyeMidY) * 0.5);
+  // Neutral nose offset below eye baseline in upright posture is approximately +0.035
+  const pitchOffset = (nose.y - faceBaselineY - 0.035) / faceHeight;
   const headPitch = clamp(
-    (nose.y - shoulderMidY + 0.12) * 1.8 * motionGain,
+    pitchOffset * 1.35 * motionGain,
     ROBOT_LIMITS.neckPitch[0],
     ROBOT_LIMITS.neckPitch[1]
-  );
-  const eyeL = poseLandmarks[2] || poseLandmarks[0];
-  const eyeR = poseLandmarks[5] || poseLandmarks[0];
-  const headRoll = clamp(
-    Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x),
-    ROBOT_LIMITS.neckRoll[0],
-    ROBOT_LIMITS.neckRoll[1]
   );
 
   // Directional Eye Gaze: -1 to +1
@@ -621,38 +660,40 @@ export function retargetHumanPose(
   const torsoLean = clamp((shoulderMidX - hipMidX) * 2.0 * motionGain, -0.25, 0.25);
 
   // ------------------------------------------------------------------------
-  // ARM KINEMATICS WITH COORDINATE-CONSISTENT INVERSE KINEMATICS
+  // INDEPENDENT LEFT & RIGHT ARM INPUT STREAMS
   // ------------------------------------------------------------------------
-  // If fused hand wrist is provided (normalized screen space), we MUST use
-  // normalized pose shoulder & elbow to ensure 100% consistent coordinate space.
   const hasWorldLandmarks = Boolean(worldLandmarks && worldLandmarks.length >= 25);
 
-  const useWorldL = Boolean(hasWorldLandmarks && !leftFusedWrist && worldLandmarks);
-  const lShoulderPt = (useWorldL ? worldLandmarks![11] : lShoulder) || lShoulder;
-  const lElbowPt = (useWorldL ? worldLandmarks![13] : lElbow) || lElbow;
-  const lWristPt = leftFusedWrist || (useWorldL ? worldLandmarks![15] : lWrist) || lWrist;
+  // LEFT ARM STREAM (strictly isolated from right arm and right hand)
+  const lShoulderPt = (hasWorldLandmarks && !leftFusedWrist ? worldLandmarks![11] : lShoulder) || lShoulder;
+  const lElbowPt = (hasWorldLandmarks && !leftFusedWrist ? worldLandmarks![13] : lElbow) || lElbow;
+  const lWristPt = leftFusedWrist || (hasWorldLandmarks ? worldLandmarks![15] : lWrist) || lWrist;
   const lSource: 'HAND' | 'POSE' | 'NONE' = leftFusedWrist ? 'HAND' : lWristPt ? 'POSE' : 'NONE';
+  const lIsMetric = hasWorldLandmarks && !leftFusedWrist;
 
   const lIK = retargetIKSolverLeft.solveFromLandmarks(
     lShoulderPt,
     lElbowPt,
     lWristPt,
     motionGain,
-    useWorldL
+    lIsMetric,
+    timestampMs
   );
 
-  const useWorldR = Boolean(hasWorldLandmarks && !rightFusedWrist && worldLandmarks);
-  const rShoulderPt = (useWorldR ? worldLandmarks![12] : rShoulder) || rShoulder;
-  const rElbowPt = (useWorldR ? worldLandmarks![14] : rElbow) || rElbow;
-  const rWristPt = rightFusedWrist || (useWorldR ? worldLandmarks![16] : rWrist) || rWrist;
+  // RIGHT ARM STREAM (strictly isolated from left arm and left hand)
+  const rShoulderPt = (hasWorldLandmarks && !rightFusedWrist ? worldLandmarks![12] : rShoulder) || rShoulder;
+  const rElbowPt = (hasWorldLandmarks && !rightFusedWrist ? worldLandmarks![14] : rElbow) || rElbow;
+  const rWristPt = rightFusedWrist || (hasWorldLandmarks ? worldLandmarks![16] : rWrist) || rWrist;
   const rSource: 'HAND' | 'POSE' | 'NONE' = rightFusedWrist ? 'HAND' : rWristPt ? 'POSE' : 'NONE';
+  const rIsMetric = hasWorldLandmarks && !rightFusedWrist;
 
   const rIK = retargetIKSolverRight.solveFromLandmarks(
     rShoulderPt,
     rElbowPt,
     rWristPt,
     motionGain,
-    useWorldR
+    rIsMetric,
+    timestampMs
   );
 
   return {
@@ -674,6 +715,10 @@ export function retargetHumanPose(
     activeArmSource: {
       left: lSource,
       right: rSource,
+    },
+    jointVelocities: {
+      left: lIK.velocities,
+      right: rIK.velocities,
     },
     ikMetrics: {
       leftReachRatio: lIK.reachRatio,

@@ -48,6 +48,14 @@ import { DebugDrawer } from './components/DebugDrawer';
 import { CalibrationModal } from './components/CalibrationModal';
 import { SettingsModal } from './components/SettingsModal';
 
+// Shortest angular difference interpolation to prevent 360-degree Euler wrapping and flipping through zero
+function lerpAngle(current: number, target: number, alpha: number): number {
+  let diff = (target - current) % (Math.PI * 2);
+  if (diff > Math.PI) diff -= Math.PI * 2;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return current + diff * alpha;
+}
+
 // MediaPipe Connection lines for video overlay
 const POSE_CONNECTIONS: [number, number][] = [
   [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
@@ -108,6 +116,15 @@ export default function App() {
     isDone: false,
   });
   const calibrationSamplesRef = useRef<number[]>([]);
+  const isCalibratingRef = useRef(calibration.isCalibrating);
+  useEffect(() => {
+    isCalibratingRef.current = calibration.isCalibrating;
+  }, [calibration.isCalibrating]);
+
+  const modeRef = useRef(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
@@ -116,7 +133,7 @@ export default function App() {
     mirrorView: true,
     showSkeleton: true,
     showFingers: true,
-    poseModelQuality: 'full',
+    poseModelQuality: 'lite', // Ultra-fast 30+ FPS pose tracking
     cameraView: 'front',
     enablePickPlace: true,
     enableDebug: false,
@@ -131,6 +148,8 @@ export default function App() {
     showBodyBoundaryShield: false,
     futuristicMode: false,
     responsePreset: 'ultra_fast',
+    poseConfidenceThreshold: 0.25,
+    showLatencyDiagnostics: true,
   });
 
   const [boundaryDeflection, setBoundaryDeflection] = useState<{ left: boolean; right: boolean }>({
@@ -144,6 +163,9 @@ export default function App() {
     setRetargeterBodyBoundary(settings.bodyBoundaryEnabled);
     if (visionManagerRef.current) {
       visionManagerRef.current.setResponsePreset(settings.responsePreset);
+      visionManagerRef.current.setPoseConfidenceThreshold(settings.poseConfidenceThreshold);
+      visionManagerRef.current.setMotionGain(settings.motionGain);
+      visionManagerRef.current.setUseOneEuroFilter(settings.enableOneEuroFilter);
     }
   }, [settings]);
 
@@ -295,27 +317,57 @@ export default function App() {
         setCurrentGesture(curKf.gesture as GestureType);
       }
 
-      // Exponential Kinematic Smoothing: alpha = 1 - exp(-dt / tau)
+      // Velocity-Adaptive Kinematic Responsiveness:
+      // Bypasses redundant intermediate-frame delay during human movement,
+      // eliminating camera-to-robot lag while retaining rock-solid stability at rest.
       const currentSettings = settingsRef.current;
       const tau = currentSettings.smoothingTau;
-      const alpha = 1 - Math.exp(-dt / Math.max(0.001, tau));
+      const baseAlpha = 1 - Math.exp(-dt / Math.max(0.001, tau));
 
       const curAngles = currentAnglesRef.current;
       const tgtAngles = targetAnglesRef.current;
 
+      // Calculate instantaneous motion delta across arms and head
+      const dL = Math.hypot(
+        tgtAngles.lShoulderZ - curAngles.lShoulderZ,
+        tgtAngles.lShoulderX - curAngles.lShoulderX,
+        tgtAngles.lElbow - curAngles.lElbow
+      );
+      const dR = Math.hypot(
+        tgtAngles.rShoulderZ - curAngles.rShoulderZ,
+        tgtAngles.rShoulderX - curAngles.rShoulderX,
+        tgtAngles.rElbow - curAngles.rElbow
+      );
+      const dHead = Math.hypot(
+        tgtAngles.headYaw - curAngles.headYaw,
+        tgtAngles.headPitch - curAngles.headPitch,
+        tgtAngles.headRoll - curAngles.headRoll
+      );
+      const maxMotion = Math.max(dL, dR, dHead);
+
+      // When moving rapidly, boost tracking alpha up to 0.94 to cancel latency
+      const dynamicAlpha = THREE.MathUtils.clamp(
+        baseAlpha + (maxMotion > 0.03 ? 0.65 * Math.min(1.0, maxMotion / 0.22) : 0),
+        baseAlpha,
+        0.95
+      );
+
       Object.keys(curAngles).forEach(k => {
         const key = k as keyof RobotJointAngles;
         if (typeof curAngles[key] === 'number') {
-          (curAngles as any)[key] = lerp((curAngles as any)[key], (tgtAngles as any)[key], alpha);
+          if (key === 'eyeX' || key === 'eyeY') {
+            (curAngles as any)[key] = lerp((curAngles as any)[key], (tgtAngles as any)[key], dynamicAlpha);
+          } else {
+            (curAngles as any)[key] = lerpAngle((curAngles as any)[key], (tgtAngles as any)[key], dynamicAlpha);
+          }
         } else {
           (curAngles as any)[key] = (tgtAngles as any)[key];
         }
       });
 
-      // Finger smoothing
-      const fingerAlpha = Math.min(1.0, alpha * 1.5);
+      // Finger responsiveness: instantaneous gesture articulation with zero lag
+      const fingerAlpha = Math.max(dynamicAlpha, 0.88);
       (['thumb', 'index', 'middle', 'ring', 'pinky'] as const).forEach(f => {
-        ['mcp', 'pip', 'dip'] as const;
         leftFingersRef.current[f].mcp = lerp(
           leftFingersRef.current[f].mcp,
           targetLeftFingersRef.current[f].mcp,
@@ -521,12 +573,19 @@ export default function App() {
   useEffect(() => {
     const vision = new VisionManager({
       onPoseUpdate: data => {
-        if (mode === 'DEMO') return;
+        if (modeRef.current === 'DEMO') return;
 
-        // Apply new target joint angles directly to mutable refs (zero React lag)
-        targetAnglesRef.current = data.angles;
-        targetLeftFingersRef.current = data.leftHand.fingers;
-        targetRightFingersRef.current = data.rightHand.fingers;
+        // Check user-configured pose confidence threshold or active hand tracking
+        const threshold = settingsRef.current.poseConfidenceThreshold ?? 0.25;
+        const hasHand = data.leftHand.detected || data.rightHand.detected;
+        const meetsThreshold = data.metrics.poseConfidence >= threshold || hasHand;
+
+        if (meetsThreshold) {
+          // Apply new target joint angles directly to mutable refs (zero React lag)
+          targetAnglesRef.current = data.angles;
+          targetLeftFingersRef.current = data.leftHand.fingers;
+          targetRightFingersRef.current = data.rightHand.fingers;
+        }
 
         // Determine state label
         let nextResponse = 'STANDBY';
@@ -538,7 +597,7 @@ export default function App() {
           nextResponse = 'PRECISION GRIP';
         } else if (data.gesture === 'VICTORY') {
           nextResponse = 'VICTORY SIGN';
-        } else if (data.metrics.poseConfidence > 0.4) {
+        } else if (meetsThreshold) {
           nextResponse = 'MIRRORING';
         }
 
@@ -575,25 +634,29 @@ export default function App() {
         }
 
         // Handle calibration sampling
-        if (calibration.isCalibrating && data.metrics.poseConfidence > 0.5) {
-          calibrationSamplesRef.current.push(1);
-          const count = calibrationSamplesRef.current.length;
-          const prog = Math.min(100, Math.round((count / 30) * 100));
-          setCalibration(c => ({
-            ...c,
-            progress: prog,
-            samplesCount: count,
-          }));
+        if (isCalibratingRef.current) {
+          if (data.metrics.poseConfidence >= (settingsRef.current.poseConfidenceThreshold ?? 0.20) * 0.7 || hasHand) {
+            calibrationSamplesRef.current.push(1);
+            const count = calibrationSamplesRef.current.length;
+            const targetSamples = 20;
+            const prog = Math.min(100, Math.round((count / targetSamples) * 100));
+            setCalibration(c => ({
+              ...c,
+              progress: prog,
+              samplesCount: count,
+            }));
 
-          if (count >= 30) {
-            setTimeout(() => {
-              setCalibration(c => ({
-                ...c,
-                isCalibrating: false,
-                isDone: true,
-              }));
-              setMode('LIVE');
-            }, 600);
+            if (count >= targetSamples) {
+              setTimeout(() => {
+                setCalibration(c => ({
+                  ...c,
+                  progress: 100,
+                  isCalibrating: false,
+                  isDone: true,
+                }));
+                setMode('LIVE');
+              }, 400);
+            }
           }
         }
       },
@@ -608,7 +671,7 @@ export default function App() {
         const h = canvas.height;
 
         // Draw Pose Skeleton
-        if (settings.showSkeleton && poseLm) {
+        if (settingsRef.current.showSkeleton && poseLm) {
           ctx.lineWidth = 2.5;
           ctx.strokeStyle = '#00b4d8';
           ctx.beginPath();
@@ -635,7 +698,7 @@ export default function App() {
         }
 
         // Draw Hands Knuckles and 21 Finger Landmarks
-        if (settings.showFingers && handsLm) {
+        if (settingsRef.current.showFingers && handsLm) {
           handsLm.forEach(hand => {
             ctx.lineWidth = 1.8;
             ctx.strokeStyle = 'rgba(0, 210, 255, 0.85)';
@@ -661,8 +724,8 @@ export default function App() {
     });
 
     visionManagerRef.current = vision;
-    vision.setMotionGain(settings.motionGain);
-  }, [calibration.isCalibrating, mode, settings.motionGain, settings.showFingers, settings.showSkeleton]);
+    vision.setMotionGain(settingsRef.current.motionGain);
+  }, []);
 
   // -------------------------------------------------------------
   // 4. Start Webcam Feed
@@ -676,8 +739,9 @@ export default function App() {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 480, max: 480 },
+          frameRate: { ideal: 30, max: 60 },
           facingMode: 'user',
         },
         audio: false,
@@ -732,7 +796,7 @@ export default function App() {
   };
 
   // Start Calibration
-  const handleStartCalibration = () => {
+  const handleStartCalibration = async () => {
     calibrationSamplesRef.current = [];
     setCalibration({
       isCalibrating: true,
@@ -743,6 +807,14 @@ export default function App() {
       samplesCount: 0,
       isDone: false,
     });
+    // If in demo mode, switch to LIVE so camera feeds real user calibration
+    if (mode === 'DEMO') {
+      setMode('LIVE');
+    }
+    // If camera is not yet running, start it immediately
+    if (!isCameraActive) {
+      await handleStartCamera();
+    }
   };
 
   return (
@@ -781,6 +853,7 @@ export default function App() {
             leftHand={leftHandState}
             rightHand={rightHandState}
             metrics={metrics}
+            poseConfidenceThreshold={settings.poseConfidenceThreshold}
             onToggleMirror={handleToggleMirror}
             onStartCamera={handleStartCamera}
           />
@@ -870,6 +943,7 @@ export default function App() {
       {/* Calibration Wizard Modal */}
       <CalibrationModal
         calibration={calibration}
+        isCameraActive={isCameraActive}
         onCancel={() =>
           setCalibration(c => ({
             ...c,

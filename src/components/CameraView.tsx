@@ -16,6 +16,7 @@ interface CameraViewProps {
   leftHand: HandTrackingState;
   rightHand: HandTrackingState;
   metrics: TrackingMetrics;
+  poseConfidenceThreshold?: number;
   onToggleMirror: () => void;
   onStartCamera: () => void;
 }
@@ -29,6 +30,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
   leftHand,
   rightHand,
   metrics,
+  poseConfidenceThreshold = 0.25,
   onToggleMirror,
   onStartCamera,
 }) => {
@@ -106,10 +108,10 @@ export const CameraView: React.FC<CameraViewProps> = ({
         )}
 
         {/* Low Confidence or Lost Tracking Banner */}
-        {isCameraActive && metrics.poseConfidence < 0.35 && (
+        {isCameraActive && metrics.poseConfidence < poseConfidenceThreshold && (
           <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-md bg-amber-500/90 text-slate-950 font-mono text-[11px] font-semibold flex items-center gap-2 backdrop-blur-xs shadow-md border border-amber-400/40">
             <ShieldAlert className="w-4 h-4 text-slate-950" />
-            <span>STAND BACK SO SHOULDERS ARE VISIBLE</span>
+            <span>LOW LIGHT / POSE CONFIDENCE BELOW {Math.round(poseConfidenceThreshold * 100)}%</span>
           </div>
         )}
       </div>

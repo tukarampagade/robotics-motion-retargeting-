@@ -33,11 +33,19 @@ export interface Landmark3D {
   visibility?: number;
 }
 
+export interface ArmJointVelocities {
+  shoulderZ: number;
+  shoulderX: number;
+  shoulderY: number;
+  elbow: number;
+}
+
 export interface ArmIKSolution {
   shoulderZ: number;
   shoulderX: number;
   shoulderY: number;
   elbow: number;
+  velocities?: ArmJointVelocities;
   solvedWristPos: THREE.Vector3;
   solvedElbowPos: THREE.Vector3;
   reachRatio: number;
@@ -53,10 +61,29 @@ export interface BodyBoundaryResult {
   penetration: number;
 }
 
+// Shortest angular difference interpolation to prevent 360-degree Euler wrapping and flipping through zero
+function lerpAngle(current: number, target: number, alpha: number): number {
+  let diff = (target - current) % (Math.PI * 2);
+  if (diff > Math.PI) diff -= Math.PI * 2;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return current + diff * alpha;
+}
+
+function shortestAngleDiff(target: number, current: number): number {
+  let diff = (target - current) % (Math.PI * 2);
+  if (diff > Math.PI) diff -= Math.PI * 2;
+  if (diff < -Math.PI) diff += Math.PI * 2;
+  return diff;
+}
+
 /**
  * Body Boundary Collision Envelope & Deflection System.
- * Strictly prevents robot arms, wrists, forearms, and hands from penetrating
- * into the robot's own chest, torso, abdomen, pelvis, or head.
+ * Accurately models the robot's physical torso, head, and base geometry:
+ * - Shoulders are mounted at x = ±0.255m. The resting arm hangs at x ~ ±0.255m.
+ * - Real chest armor is width 0.44m (extends x: -0.22m to +0.22m).
+ * - Central chest corridor is |tx| < 0.20m.
+ * Arms at the side (|tx| >= 0.21m) move freely with ZERO false collisions or forward pushing.
+ * Hands crossing into the chest (|tx| < 0.20m) are safely guided in front of the chest armor (tz >= 0.14m).
  */
 export function enforceBodyBoundary(
   posInShoulderFrame: THREE.Vector3,
@@ -80,121 +107,79 @@ export function enforceBodyBoundary(
 
   let deflected = false;
   let maxPenetration = 0;
-  const softThresholdZone = 0.08; // 8cm soft-clamping deceleration zone
 
-  // 1. Head & Neck Collision Volume:
-  // Center: (0, 0.82, 0.04), safe radius = 0.23m
-  if (ty > 0.60) {
-    const headCenter = new THREE.Vector3(0, 0.82, 0.04);
-    const toHead = new THREE.Vector3(tx, ty, tz).sub(headCenter);
-    const distHead = toHead.length();
-    const rHeadHard = 0.23;
-    const rHeadSoft = rHeadHard + softThresholdZone;
-
-    if (distHead < rHeadSoft) {
-      const norm = distHead > 1e-4 ? toHead.clone().normalize() : new THREE.Vector3(0, 0, 1);
-      if (distHead < rHeadHard) {
-        const pen = rHeadHard - distHead;
-        maxPenetration = Math.max(maxPenetration, pen);
-        deflected = true;
-        const clampedR = rHeadHard + 0.008 * Math.tanh(-pen / 0.008);
-        tx = headCenter.x + norm.x * clampedR;
-        ty = headCenter.y + norm.y * clampedR;
-        tz = headCenter.z + norm.z * clampedR;
-      } else {
-        // Soft-clamping threshold: smoothly slow down arm movement towards boundary
-        const u = (distHead - rHeadHard) / softThresholdZone; // 1 -> 0
-        const smoothDecel = u * u * (3 - 2 * u);
-        const clampedR = rHeadHard + softThresholdZone * Math.pow(u, 1.45);
-        tx = headCenter.x + norm.x * clampedR;
-        ty = headCenter.y + norm.y * clampedR;
-        tz = headCenter.z + norm.z * clampedR;
-        deflected = true;
-      }
-    }
-  }
-
-  // 2. Thorax, Ribs & Sculpted Chest Armor Collision Envelope (ty between -0.42 and 0.65)
-  // Chest box is width 0.44 (|tx| <= 0.22), height 0.42 (ty: 0.17..0.59), depth 0.24 (tz: -0.10..0.14)
-  // With sternum, vents, and forearm/hand thickness, front clearance requires tz >= 0.22m for |tx| < 0.26m.
-  if (ty >= -0.42 && ty <= 0.65) {
-    // Elliptical cross-section: Rx ~0.265m (chest) down to ~0.23m (waist)
-    const tH = Math.max(0, Math.min(1, (ty + 0.42) / 1.07));
-    const rx = 0.245 + 0.035 * Math.sin(tH * Math.PI);
-    const rz = 0.195;
-    const zCenter = 0.02;
-
-    const qx = tx / rx;
-    const qz = (tz - zCenter) / rz;
-    const distEllipse = Math.hypot(qx, qz);
-    const avgR = (rx + rz) * 0.5;
-    const deltaQSoft = softThresholdZone / avgR;
-
-    const isFrontChestCorridor = Math.abs(tx) < 0.26 && tz > -0.18;
-    const minFrontClearanceZ = 0.22;
-
-    if (isFrontChestCorridor && tz < minFrontClearanceZ) {
-      // Direct front chest anti-penetration: strictly push hand/wrist forward outside chest armor
-      const pen = minFrontClearanceZ - tz;
+  // 1. Head & Cranial Guard (ty > 0.66m):
+  // Head is centered at (0, 0.82, 0.04) with width 0.24m (half-width 0.12m).
+  // Only deflect if hand/elbow enters the central cranial volume (|tx| < 0.15m and ty between 0.66m and 1.05m).
+  if (ty > 0.66 && Math.abs(tx) < 0.15) {
+    const distHead = Math.hypot(tx / 0.14, (ty - 0.82) / 0.17, (tz - 0.04) / 0.15);
+    if (distHead < 1.0) {
+      const pen = (1.0 - distHead) * 0.14;
       maxPenetration = Math.max(maxPenetration, pen);
       deflected = true;
-      tz = minFrontClearanceZ;
-    } else if (distEllipse < 1.0 + deltaQSoft) {
-      if (distEllipse < 1.0) {
-        const pen = (1.0 - distEllipse) * avgR;
+      const pushSign = tx >= 0 ? 1 : -1;
+      tx = pushSign * 0.155;
+    }
+  }
+
+  // 2. Thorax & Sculpted Chest Armor Guard (ty between 0.15m and 0.62m):
+  // Chest armor is width 0.44m (half-width 0.22m, front surface at tz = 0.12m).
+  // Shoulders are mounted on the exterior at x = ±0.255m.
+  // When the arm hangs down at the side (|tx| >= 0.21m), it is completely in free air outside the chest.
+  // We ONLY prevent penetration if the hand moves into the central chest zone (|tx| < 0.20m).
+  if (ty >= 0.15 && ty <= 0.62) {
+    const chestHalfWidth = 0.20;
+    const minFrontZ = 0.14; // Surface of chest armor + clearance margin
+    const backLimitZ = -0.12;
+
+    if (Math.abs(tx) < chestHalfWidth && tz < minFrontZ && tz > backLimitZ) {
+      if (tz >= 0.0) {
+        // Hand is in front of torso: safely keep it in front of the chest armor
+        const pen = minFrontZ - tz;
         maxPenetration = Math.max(maxPenetration, pen);
+        tz = minFrontZ;
         deflected = true;
-
-        const clampedQ = 1.0 + 0.015 * Math.tanh((distEllipse - 1.0) / 0.015);
-        const factor = (1.0 / Math.max(distEllipse, 1e-4)) * clampedQ;
-        let outX = qx * factor * rx;
-        let outZ = zCenter + qz * factor * rz;
-
-        if (tz > -0.12) {
-          if (outZ < 0.22) outZ = 0.22;
-        } else {
-          if (outZ > -0.18) outZ = -0.18;
-        }
-        tx = outX;
-        tz = outZ;
       } else {
-        // Soft-clamping threshold: smoothly slow down approaching arm movement
-        const u = (distEllipse - 1.0) / deltaQSoft;
-        const clampedQ = 1.0 + deltaQSoft * Math.pow(u, 1.45);
-        const factor = clampedQ / Math.max(distEllipse, 1e-4);
-        let outX = qx * factor * rx;
-        let outZ = zCenter + qz * factor * rz;
-
-        if (tz > -0.12 && outZ < 0.22) {
-          outZ = THREE.MathUtils.lerp(0.22, outZ, u);
-        }
-        tx = outX;
-        tz = outZ;
+        // Hand reaches from behind: guide outward laterally
+        const pen = chestHalfWidth - Math.abs(tx);
+        maxPenetration = Math.max(maxPenetration, pen);
+        tx = sign * chestHalfWidth;
         deflected = true;
       }
     }
   }
 
-  // 3. Pelvis & Mount Base Collision Envelope (for ty < -0.42)
-  if (ty < -0.42) {
-    const rPelvisHard = 0.24;
-    const rPelvisSoft = rPelvisHard + softThresholdZone;
-    const distP = Math.hypot(tx, tz);
-    if (distP < rPelvisSoft) {
-      if (distP < rPelvisHard) {
-        maxPenetration = Math.max(maxPenetration, rPelvisHard - distP);
-        deflected = true;
-        const clampedR = rPelvisHard + 0.01 * Math.tanh(-(rPelvisHard - distP) / 0.01);
-        const s = clampedR / Math.max(distP, 1e-4);
-        tx *= s;
-        tz *= s;
+  // 3. Waist & Spine Column Guard (ty between -0.30m and 0.15m):
+  // Spine column radius is 0.15m. Arms hanging at ±0.255m have ample natural clearance.
+  if (ty >= -0.30 && ty < 0.15) {
+    const spineRadius = 0.16;
+    const distSpine = Math.hypot(tx, tz);
+    if (distSpine < spineRadius) {
+      const pen = spineRadius - distSpine;
+      maxPenetration = Math.max(maxPenetration, pen);
+      deflected = true;
+      if (distSpine > 1e-4) {
+        tx = (tx / distSpine) * spineRadius;
+        tz = (tz / distSpine) * spineRadius;
       } else {
-        const u = (distP - rPelvisHard) / softThresholdZone;
-        const clampedR = rPelvisHard + softThresholdZone * Math.pow(u, 1.45);
-        const s = clampedR / Math.max(distP, 1e-4);
-        tx *= s;
-        tz *= s;
-        deflected = true;
+        tx = sign * spineRadius;
+      }
+    }
+  }
+
+  // 4. Pelvis & Pedestal Mount Base Guard (ty < -0.30m):
+  if (ty < -0.30) {
+    const rPelvis = 0.20;
+    const distP = Math.hypot(tx, tz);
+    if (distP < rPelvis) {
+      const pen = rPelvis - distP;
+      maxPenetration = Math.max(maxPenetration, pen);
+      deflected = true;
+      if (distP > 1e-4) {
+        tx = (tx / distP) * rPelvis;
+        tz = (tz / distP) * rPelvis;
+      } else {
+        tx = sign * rPelvis;
       }
     }
   }
@@ -237,6 +222,13 @@ export class RobotArmIKSolver {
   private prevShoulderAngles: { z: number; x: number; y: number };
   private prevElbowAngle: number;
   private isInitialized: boolean = false;
+  private lastSolveTimestamp: number = 0;
+  private angularVelocities: ArmJointVelocities = {
+    shoulderZ: 0,
+    shoulderX: 0,
+    shoulderY: 0,
+    elbow: 0,
+  };
 
   constructor(side: 'left' | 'right', upperArmLen = 0.32, forearmLen = 0.28) {
     this.side = side;
@@ -262,16 +254,28 @@ export class RobotArmIKSolver {
     this.isInitialized = false;
     this.lastDeflectionAmount = 0;
     this.isDeflected = false;
+    this.lastSolveTimestamp = 0;
+    this.angularVelocities = { shoulderZ: 0, shoulderX: 0, shoulderY: 0, elbow: 0 };
   }
 
   /**
    * Solves 2-bone analytical arm IK for target wrist position and optional elbow hint.
    * Coordinates are in the shoulder's local frame: +X: right, +Y: up, +Z: forward towards camera.
    */
-  public solve(targetWrist: THREE.Vector3, targetElbowHint?: THREE.Vector3): ArmIKSolution {
+  public solve(
+    targetWrist: THREE.Vector3,
+    targetElbowHint?: THREE.Vector3,
+    timestampMs?: number
+  ): ArmIKSolution {
     const L1 = this.upperArmLength;
     const L2 = this.forearmLength;
     const Ltotal = this.totalReach;
+
+    const now = timestampMs ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const dt = this.lastSolveTimestamp > 0
+      ? THREE.MathUtils.clamp((now - this.lastSolveTimestamp) / 1000, 0.005, 0.1)
+      : 0.033;
+    this.lastSolveTimestamp = now;
 
     // 0. Body Collision Boundary Enforcement
     // Strictly bounds the target wrist position so it never penetrates the torso, chest, or head
@@ -404,39 +408,6 @@ export class RobotArmIKSolver {
 
     let solvedWrist = u.clone().multiplyScalar(dEff);
 
-    // -------------------------------------------------------------
-    // 3b. Full Forearm & Hand Collision Guard (Post-Kinematic Check)
-    // -------------------------------------------------------------
-    // Verify that the solved wrist, hand, and mid-forearm stay strictly in front of the chest armor
-    if (this.bodyBoundaryEnabled) {
-      const txE = solvedElbow.x + sign * 0.255;
-      const tyE = solvedElbow.y + 0.54;
-      const tzE = solvedElbow.z + 0.01;
-
-      let txW = solvedWrist.x + sign * 0.255;
-      let tyW = solvedWrist.y + 0.54;
-      let tzW = solvedWrist.z + 0.01;
-
-      const vForearmDir = new THREE.Vector3().subVectors(solvedWrist, solvedElbow).normalize();
-      const txHand = txW + vForearmDir.x * 0.10;
-      const tyHand = tyW + vForearmDir.y * 0.10;
-      const tzHand = tzW + vForearmDir.z * 0.10;
-      const midForearmZ = (tzE + tzW) * 0.5;
-
-      const minSafeChestZ = 0.22;
-      const inChestCorridor = Math.abs(txW) < 0.26 && tyW >= 0.10 && tyW <= 0.65;
-      if (inChestCorridor) {
-        const minZFound = Math.min(tzW, tzHand, midForearmZ);
-        if (minZFound < minSafeChestZ) {
-          const pushDeltaZ = minSafeChestZ - minZFound;
-          solvedWrist.z += pushDeltaZ;
-          dEff = solvedWrist.length();
-          isDeflected = true;
-          deflectionDistance = Math.max(deflectionDistance, pushDeltaZ);
-        }
-      }
-    }
-
     // Direction unit vectors
     const vUpper = solvedElbow.clone().multiplyScalar(1 / L1);
     const vForearm = new THREE.Vector3().subVectors(solvedWrist, solvedElbow).multiplyScalar(1 / L2);
@@ -462,28 +433,67 @@ export class RobotArmIKSolver {
     // toward resting center to eliminate rotational wandering
     if (isNearSingularity) {
       const twistDamp = Math.max(0, Math.min(1, (reachRatio - 0.88) / 0.10));
-      euler.y = THREE.MathUtils.lerp(euler.y, this.prevShoulderAngles.y, twistDamp * 0.75);
+      euler.y = lerpAngle(euler.y, this.prevShoulderAngles.y, twistDamp * 0.75);
     }
 
-    // Temporal smoothing on joint angles
-    const angleAlpha = !this.isInitialized ? 1.0 : 0.42;
-    this.prevShoulderAngles.z = THREE.MathUtils.lerp(this.prevShoulderAngles.z, euler.z, angleAlpha);
-    this.prevShoulderAngles.x = THREE.MathUtils.lerp(this.prevShoulderAngles.x, euler.x, angleAlpha);
-    this.prevShoulderAngles.y = THREE.MathUtils.lerp(this.prevShoulderAngles.y, euler.y, angleAlpha);
-    this.prevElbowAngle = THREE.MathUtils.lerp(this.prevElbowAngle, elbowAngle, angleAlpha);
+    // -------------------------------------------------------------
+    // Prioritize Angular Velocity Processing & Bypass Redundant Intermediate Frames
+    // -------------------------------------------------------------
+    // Compute instantaneous angular differences via shortest circular path
+    const diffZ = shortestAngleDiff(euler.z, this.prevShoulderAngles.z);
+    const diffX = shortestAngleDiff(euler.x, this.prevShoulderAngles.x);
+    const diffY = shortestAngleDiff(euler.y, this.prevShoulderAngles.y);
+    const diffElbow = elbowAngle - this.prevElbowAngle;
+
+    // Instantaneous angular velocities (rad/sec)
+    const instVelZ = diffZ / dt;
+    const instVelX = diffX / dt;
+    const instVelY = diffY / dt;
+    const instVelElbow = diffElbow / dt;
+
+    // Fast-tracking low-pass filter on angular velocities (alpha = 0.75)
+    this.angularVelocities.shoulderZ = THREE.MathUtils.lerp(this.angularVelocities.shoulderZ, instVelZ, 0.75);
+    this.angularVelocities.shoulderX = THREE.MathUtils.lerp(this.angularVelocities.shoulderX, instVelX, 0.75);
+    this.angularVelocities.shoulderY = THREE.MathUtils.lerp(this.angularVelocities.shoulderY, instVelY, 0.75);
+    this.angularVelocities.elbow = THREE.MathUtils.lerp(this.angularVelocities.elbow, instVelElbow, 0.75);
+
+    // Total angular speed magnitude
+    const totalSpeed = Math.hypot(
+      this.angularVelocities.shoulderZ,
+      this.angularVelocities.shoulderX,
+      this.angularVelocities.elbow
+    );
+
+    // Dynamic responsiveness & camera pipeline latency feedforward:
+    // When moving, velocityWeight approaches 1.0, bypassing sluggish intermediate states
+    // and using predictive extrapolation (~20ms lead) to cancel camera capture delay.
+    const velocityWeight = THREE.MathUtils.clamp(totalSpeed / 0.45, 0.0, 1.0);
+    const directAlpha = !this.isInitialized ? 1.0 : THREE.MathUtils.lerp(0.82, 1.0, velocityWeight);
+    const leadTime = 0.020; // 20ms predictive lead compensation
+
+    const predZ = euler.z + this.angularVelocities.shoulderZ * leadTime * velocityWeight;
+    const predX = euler.x + this.angularVelocities.shoulderX * leadTime * velocityWeight;
+    const predY = euler.y + this.angularVelocities.shoulderY * leadTime * velocityWeight;
+    const predElbow = elbowAngle + this.angularVelocities.elbow * leadTime * velocityWeight;
+
+    this.prevShoulderAngles.z = lerpAngle(this.prevShoulderAngles.z, predZ, directAlpha);
+    this.prevShoulderAngles.x = lerpAngle(this.prevShoulderAngles.x, predX, directAlpha);
+    this.prevShoulderAngles.y = lerpAngle(this.prevShoulderAngles.y, predY, directAlpha);
+    this.prevElbowAngle = THREE.MathUtils.lerp(this.prevElbowAngle, predElbow, directAlpha);
 
     this.isInitialized = true;
 
-    // Joint limit clamping - expanded to permit natural forward cross-body reaching
-    const limitsZ: [number, number] = this.side === 'left' ? [-2.6, 1.2] : [-1.2, 2.6];
-    const limitsX: [number, number] = [-2.4, 0.85];
-    const limitsY: [number, number] = [-1.4, 1.4];
+    // Biomechanically accurate joint limits with full natural articulation
+    const limitsZ: [number, number] = this.side === 'left' ? [-Math.PI, 1.85] : [-1.85, Math.PI];
+    const limitsX: [number, number] = [-2.8, 2.8];
+    const limitsY: [number, number] = [-2.5, 2.5];
 
     return {
       shoulderZ: Math.max(limitsZ[0], Math.min(limitsZ[1], this.prevShoulderAngles.z)),
       shoulderX: Math.max(limitsX[0], Math.min(limitsX[1], this.prevShoulderAngles.x)),
       shoulderY: Math.max(limitsY[0], Math.min(limitsY[1], this.prevShoulderAngles.y)),
       elbow: this.prevElbowAngle,
+      velocities: { ...this.angularVelocities },
       solvedWristPos: solvedWrist,
       solvedElbowPos: solvedElbow,
       reachRatio,
@@ -503,7 +513,8 @@ export class RobotArmIKSolver {
     elbowLm: Landmark3D,
     wristLm: Landmark3D,
     motionGain: number = 1.0,
-    isMetricWorldLandmark: boolean = false
+    isMetricWorldLandmark: boolean = false,
+    timestampMs?: number
   ): ArmIKSolution {
     const dxW = wristLm.x - shoulderLm.x;
     const dyW = wristLm.y - shoulderLm.y;
@@ -519,22 +530,27 @@ export class RobotArmIKSolver {
 
     const baseScale = (this.totalReach / Math.max(0.08, humanTotalReach)) * motionGain;
     const depthScale = isMetricWorldLandmark ? baseScale : baseScale * 1.35;
+    // In camera view, horizontally mirror movement so raising right moves robot right, left moves robot left
+    const xScale = -baseScale;
 
-    // Convert from MediaPipe frame (X: right, Y: down, Z: away from camera)
-    // to Robot local frame (+X: right, +Y: up, +Z: forward towards camera)
+    // Depth scaling without artificial forward bias
+    const targetZ = -dzW * depthScale;
+    const targetElbowZ = -dzE * depthScale;
+
+    // Convert to Robot local frame (+X: right, +Y: up, +Z: forward towards camera)
     const targetWrist = new THREE.Vector3(
-      dxW * baseScale,
+      dxW * xScale,
       -dyW * baseScale,
-      -dzW * depthScale
+      targetZ
     );
 
     const targetElbow = new THREE.Vector3(
-      dxE * baseScale,
+      dxE * xScale,
       -dyE * baseScale,
-      -dzE * depthScale
+      targetElbowZ
     );
 
-    return this.solve(targetWrist, targetElbow);
+    return this.solve(targetWrist, targetElbow, timestampMs);
   }
 }
 
@@ -581,7 +597,8 @@ export interface HumanoidRobotRig {
       elbowLm: Landmark3D,
       wristLm: Landmark3D,
       motionGain?: number,
-      isMetricWorldLandmark?: boolean
+      isMetricWorldLandmark?: boolean,
+      timestampMs?: number
     ) => ArmIKSolution;
   };
   updatePose: (
@@ -1353,7 +1370,8 @@ export function createHumanoidRobot(): HumanoidRobotRig {
         elbowLm: Landmark3D,
         wristLm: Landmark3D,
         motionGain: number = 1.0,
-        isMetricWorldLandmark: boolean = false
+        isMetricWorldLandmark: boolean = false,
+        timestampMs?: number
       ) => {
         const solver = side === 'left' ? leftIKSolver : rightIKSolver;
         return solver.solveFromLandmarks(
@@ -1361,7 +1379,8 @@ export function createHumanoidRobot(): HumanoidRobotRig {
           elbowLm,
           wristLm,
           motionGain,
-          isMetricWorldLandmark
+          isMetricWorldLandmark,
+          timestampMs
         );
       },
     },

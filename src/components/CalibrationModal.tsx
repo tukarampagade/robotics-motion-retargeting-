@@ -9,11 +9,13 @@ import { CalibrationData } from '../types';
 
 interface CalibrationModalProps {
   calibration: CalibrationData;
+  isCameraActive: boolean;
   onCancel: () => void;
 }
 
 export const CalibrationModal: React.FC<CalibrationModalProps> = ({
   calibration,
+  isCameraActive,
   onCancel,
 }) => {
   if (!calibration.isCalibrating) return null;
@@ -62,8 +64,10 @@ export const CalibrationModal: React.FC<CalibrationModalProps> = ({
         </div>
 
         <p className="font-mono text-xs text-cyan-700 font-medium mb-6">
-          {calibration.progress < 100
-            ? 'Sampling body dimensions and neutral shoulder width...'
+          {!isCameraActive
+            ? 'Starting camera feed for calibration...'
+            : calibration.progress < 100
+            ? `Sampling body dimensions... (${calibration.samplesCount || 0}/20)`
             : 'Calibration complete! Linking kinematics...'}
         </p>
 
