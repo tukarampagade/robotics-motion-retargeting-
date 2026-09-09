@@ -21,6 +21,7 @@ export interface LabEnvironment {
   setCameraPreset: (preset: 'front' | '3q' | 'side' | 'top' | 'close') => void;
   updateCamera: (dt: number) => void;
   resize: (width: number, height: number) => void;
+  dispose: () => void;
 }
 
 export const CAMERA_PRESETS = {
@@ -296,5 +297,10 @@ export function setupLabEnvironment(canvas: HTMLCanvasElement): LabEnvironment {
     setCameraPreset,
     updateCamera,
     resize,
+    dispose: () => {
+      try {
+        renderer.dispose();
+      } catch (_) {}
+    },
   };
 }

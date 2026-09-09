@@ -58,17 +58,63 @@ export interface HandFingersState {
   pinky: FingerJoints;
 }
 
+export interface FingerJointsDebug {
+  raw: FingerJoints;
+  calibrated: FingerJoints;
+  robot: FingerJoints;
+}
+
+export interface HandDebugTelemetry {
+  gesture: GestureType;
+  confidence: number;
+  handLabel: 'Left' | 'Right';
+  palmSize: number;
+  pinchDistance: number;
+  isPinching: boolean;
+  fingers: {
+    thumb: FingerJointsDebug;
+    index: FingerJointsDebug;
+    middle: FingerJointsDebug;
+    ring: FingerJointsDebug;
+    pinky: FingerJointsDebug;
+  };
+}
+
+export interface HandCalibrationProfile {
+  isCalibrated: boolean;
+  palmWidthRef: number;
+  neutralAngles: HandFingersState;
+  neutralThumbPos: { x: number; y: number; z: number };
+  neutralWristOri: { roll: number; pitch: number; yaw: number };
+  jointScales: {
+    thumb: FingerJoints;
+    index: FingerJoints;
+    middle: FingerJoints;
+    ring: FingerJoints;
+    pinky: FingerJoints;
+  };
+}
+
 export type GestureType =
   | '—'
   | 'OPEN_PALM'
   | 'FIST'
+  | 'GRAB'
   | 'POINT'
   | 'VICTORY'
   | 'THUMBS_UP'
   | 'THUMBS_DOWN'
   | 'PINCH'
   | 'WAVE'
+  | 'WRIST_ROTATE'
   | 'MIRRORING';
+
+export interface LandmarkPoint {
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+}
 
 export interface HandTrackingState {
   detected: boolean;
@@ -78,8 +124,11 @@ export interface HandTrackingState {
   wristOrientation: { roll: number; pitch: number; yaw: number };
   fingers: HandFingersState;
   gesture: GestureType;
+  palmSize: number;
   pinchDistance: number;
   isGrip: boolean;
+  debugTelemetry?: HandDebugTelemetry;
+  landmarks?: LandmarkPoint[];
 }
 
 export interface PoseTrackingState {
@@ -90,6 +139,28 @@ export interface PoseTrackingState {
   lArm: { shoulderZ: number; shoulderX: number; shoulderY: number; elbow: number };
   rArm: { shoulderZ: number; shoulderX: number; shoulderY: number; elbow: number };
   torso: { yaw: number; lean: number };
+}
+
+export interface KinematicDebugData {
+  timestamp: number;
+  leftArm: {
+    upperForearmDot: number;
+    extensionVector: { x: number; y: number; z: number };
+    shoulderToWristDistance: number;
+    finalShoulderZ: number;
+    finalShoulderX: number;
+    finalShoulderY: number;
+    finalElbow: number;
+  };
+  rightArm: {
+    upperForearmDot: number;
+    extensionVector: { x: number; y: number; z: number };
+    shoulderToWristDistance: number;
+    finalShoulderZ: number;
+    finalShoulderX: number;
+    finalShoulderY: number;
+    finalElbow: number;
+  };
 }
 
 export interface TrackingMetrics {
@@ -103,6 +174,7 @@ export interface TrackingMetrics {
   leftHandConfidence: number;
   rightHandConfidence: number;
   faceConfidence: number;
+  kinematicDebug?: KinematicDebugData;
   activeArmSource: {
     left: 'HAND' | 'POSE' | 'NONE';
     right: 'HAND' | 'POSE' | 'NONE';
@@ -113,20 +185,13 @@ export interface TrackingMetrics {
     leftDist: number;
     rightDist: number;
   };
+  handCalibration?: {
+    leftCalibrated: boolean;
+    rightCalibrated: boolean;
+  };
 }
 
-export interface PickableObject {
-  id: string;
-  name: string;
-  type: 'box' | 'cylinder' | 'package';
-  color: string;
-  size: [number, number, number];
-  position: [number, number, number];
-  rotation: [number, number, number];
-  isHeld: boolean;
-  heldByHand: 'left' | 'right' | null;
-  isPlaced: boolean;
-}
+export * from './types/robot';
 
 export interface CalibrationData {
   isCalibrating: boolean;
@@ -146,7 +211,7 @@ export interface AppSettings {
   showFingers: boolean;
   poseModelQuality: 'full' | 'lite';
   cameraView: 'front' | '3q' | 'side' | 'top' | 'close';
-  enablePickPlace: boolean;
+  enableHandSignControl: boolean;
   enableDebug: boolean;
   soundEnabled: boolean;
   soundVolume: number;
@@ -162,3 +227,5 @@ export interface AppSettings {
   poseConfidenceThreshold: number;
   showLatencyDiagnostics: boolean;
 }
+
+export type InputSource = 'webcam' | 'demo';

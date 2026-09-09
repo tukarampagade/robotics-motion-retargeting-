@@ -1,6 +1,6 @@
 {
   "name": "MotionMirror AI",
-  "description": "Real-time webcam humanoid robot motion mirroring with articulated half-body robotics, finger tracking, and interactive pick & place station.",
+  "description": "Real-time vision robot teleoperation and humanoid mirroring with hand-sign robot control, fail-safe safety watchdogs, finger kinematic tracking, and interactive 3D simulation.",
   "requestFramePermissions": [
     "camera"
   ],

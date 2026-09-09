@@ -537,16 +537,21 @@ export class RobotArmIKSolver {
     const targetZ = -dzW * depthScale;
     const targetElbowZ = -dzE * depthScale;
 
+    // Vertical mapping: normalized screen space has +Y pointing down, so invert (-dyW);
+    // metric world coordinates have +Y pointing up, so preserve (+dyW).
+    const targetY = isMetricWorldLandmark ? dyW * baseScale : -dyW * baseScale;
+    const targetElbowY = isMetricWorldLandmark ? dyE * baseScale : -dyE * baseScale;
+
     // Convert to Robot local frame (+X: right, +Y: up, +Z: forward towards camera)
     const targetWrist = new THREE.Vector3(
       dxW * xScale,
-      -dyW * baseScale,
+      targetY,
       targetZ
     );
 
     const targetElbow = new THREE.Vector3(
       dxE * xScale,
-      -dyE * baseScale,
+      targetElbowY,
       targetElbowZ
     );
 
@@ -733,12 +738,13 @@ function buildHand(materials: RobotMaterialSet, sign: number): ArticulatedHand {
   handGroup.add(beacon);
 
   // Finger definitions
-  // sign: -1 for left hand, +1 for right hand
+  // sign: -1 for left hand, +1 for right hand (thumb is at sign * 0.052)
+  // Anatomical order from thumb outward: index -> middle -> ring -> pinky
   const fingerConfigs = [
-    { name: 'pinky', x: sign * 0.036, y: -0.1, len: 0.068, thick: 0.011 },
-    { name: 'ring', x: sign * 0.012, y: -0.103, len: 0.08, thick: 0.012 },
-    { name: 'middle', x: -sign * 0.012, y: -0.105, len: 0.088, thick: 0.013 },
-    { name: 'index', x: -sign * 0.035, y: -0.101, len: 0.082, thick: 0.0125 },
+    { name: 'index', x: sign * 0.033, y: -0.101, len: 0.082, thick: 0.0125 },
+    { name: 'middle', x: sign * 0.011, y: -0.105, len: 0.088, thick: 0.013 },
+    { name: 'ring', x: -sign * 0.011, y: -0.103, len: 0.08, thick: 0.012 },
+    { name: 'pinky', x: -sign * 0.033, y: -0.1, len: 0.068, thick: 0.011 },
   ] as const;
 
   const fingers: Record<string, ArticulatedFinger> = {};
@@ -862,6 +868,7 @@ function buildArm(
 
   // 5. Multi-axis Wrist Joint
   const wristPivot = new THREE.Group();
+  wristPivot.rotation.order = 'YXZ';
   wristPivot.position.y = -faLength;
   forearmPivot.add(wristPivot);
 
@@ -1206,8 +1213,8 @@ export function createHumanoidRobot(): HumanoidRobotRig {
     leftArm.elbowPivot.rotation.x = -angles.lElbow;
     leftArm.wristPivot.rotation.set(
       angles.lWristPitch,
-      angles.lWristYaw,
-      angles.lWristRoll
+      angles.lWristRoll,
+      angles.lWristYaw
     );
 
     // Right Arm Articulation
@@ -1217,8 +1224,8 @@ export function createHumanoidRobot(): HumanoidRobotRig {
     rightArm.elbowPivot.rotation.x = -angles.rElbow;
     rightArm.wristPivot.rotation.set(
       angles.rWristPitch,
-      angles.rWristYaw,
-      angles.rWristRoll
+      angles.rWristRoll,
+      angles.rWristYaw
     );
 
     // Left Hand Finger Joints (Full range articulation, forward palmar curl & anatomical thumb opposition)
@@ -1241,13 +1248,14 @@ export function createHumanoidRobot(): HumanoidRobotRig {
           fRig.dip.rotation.x = -fTarget.dip;
 
           // Natural finger abduction splay when hand is extended, converging in a fist
+          // Left hand: index at -0.033 (splays -X), middle at -0.011, ring at +0.011 (splays +X), pinky at +0.033 (splays +X)
           const splayNorm = Math.max(0, 1 - fTarget.mcp);
           if (name === 'index') {
-            fRig.mcp.rotation.z = splayNorm * 0.09;
+            fRig.mcp.rotation.z = -splayNorm * 0.08;
           } else if (name === 'ring') {
-            fRig.mcp.rotation.z = -splayNorm * 0.06;
+            fRig.mcp.rotation.z = splayNorm * 0.05;
           } else if (name === 'pinky') {
-            fRig.mcp.rotation.z = -splayNorm * 0.13;
+            fRig.mcp.rotation.z = splayNorm * 0.12;
           } else {
             fRig.mcp.rotation.z = 0;
           }
@@ -1275,13 +1283,14 @@ export function createHumanoidRobot(): HumanoidRobotRig {
           fRig.dip.rotation.x = -fTarget.dip;
 
           // Natural finger abduction splay when hand is extended, converging in a fist
+          // Right hand: index at +0.033 (splays +X), middle at +0.011, ring at -0.011 (splays -X), pinky at -0.033 (splays -X)
           const splayNorm = Math.max(0, 1 - fTarget.mcp);
           if (name === 'index') {
-            fRig.mcp.rotation.z = -splayNorm * 0.09;
+            fRig.mcp.rotation.z = splayNorm * 0.08;
           } else if (name === 'ring') {
-            fRig.mcp.rotation.z = splayNorm * 0.06;
+            fRig.mcp.rotation.z = -splayNorm * 0.05;
           } else if (name === 'pinky') {
-            fRig.mcp.rotation.z = splayNorm * 0.13;
+            fRig.mcp.rotation.z = -splayNorm * 0.12;
           } else {
             fRig.mcp.rotation.z = 0;
           }

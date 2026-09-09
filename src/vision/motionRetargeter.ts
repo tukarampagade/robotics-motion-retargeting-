@@ -9,9 +9,18 @@ import {
   GestureType,
   HandFingersState,
   JointLimits,
+  KinematicDebugData,
   RobotJointAngles,
 } from '../types';
 import { RobotArmIKSolver } from '../robot/robotModel';
+
+// Global Kinematic Debug Visualizer state
+let latestKinematicDebug: KinematicDebugData | null = null;
+let lastDebugLogTime = 0;
+
+export function getKinematicDebugData(): KinematicDebugData | null {
+  return latestKinematicDebug;
+}
 
 export const ROBOT_LIMITS: JointLimits = {
   elbow: [0, THREE_DEG(150)],
@@ -352,34 +361,26 @@ function computeIndependentFingerCurls(
   const vPipDip = { x: d.x - p.x, y: d.y - p.y, z: (d.z ?? 0) - (p.z ?? 0) };
   const vDipTip = { x: t.x - d.x, y: t.y - d.y, z: (t.z ?? 0) - (d.z ?? 0) };
 
-  // Calculate bend angles directly using vectors:
-  // Angle between bone segments: straight = 0 rad, bent 90 deg = 1.57 rad
-  // Baseline knuckle angle offset from wrist-mcp line is ~0.20 rad
-  const rawMcpAngle = Math.max(0, angleBetweenVectors(vWristMcp, vMcpPip) - 0.20);
+  // Direct independent joint angles via dot product between consecutive bone vectors:
+  // V1 = PIP - MCP, V2 = DIP - PIP, V3 = TIP - DIP
+  // angle = acos(clamp(dot(V1, V2) / (length(V1) * length(V2)), -1, 1))
+  const rawMcpAngle = Math.max(0, angleBetweenVectors(vWristMcp, vMcpPip) - 0.15);
   const pipAngle = angleBetweenVectors(vMcpPip, vPipDip);
   const dipAngle = angleBetweenVectors(vPipDip, vDipTip);
 
-  // Tip-to-knuckle contraction ratio as foreshortening compensator
-  const tipSpan = Math.hypot(t.x - m.x, t.y - m.y, (t.z ?? 0) - (m.z ?? 0));
-  const l1 = Math.hypot(vMcpPip.x, vMcpPip.y, vMcpPip.z);
-  const l2 = Math.hypot(vPipDip.x, vPipDip.y, vPipDip.z);
-  const l3 = Math.hypot(vDipTip.x, vDipTip.y, vDipTip.z);
-  const totalLen = Math.max(1e-4, l1 + l2 + l3);
-  const contraction = clamp((0.90 - tipSpan / totalLen) / 0.55, 0.0, 1.0);
-
-  // Blend direct vector angles with contraction for maximum responsiveness
+  // Apply smooth independent soft limits
   const mcpCurl = clamp(
-    Math.max(rawMcpAngle * 1.3, contraction * ROBOT_LIMITS.fingerMcp[1]),
+    rawMcpAngle * 1.15,
     ROBOT_LIMITS.fingerMcp[0],
     ROBOT_LIMITS.fingerMcp[1]
   );
   const pipCurl = clamp(
-    Math.max(pipAngle * 1.25, contraction * ROBOT_LIMITS.fingerPip[1]),
+    pipAngle * 1.18,
     ROBOT_LIMITS.fingerPip[0],
     ROBOT_LIMITS.fingerPip[1]
   );
   const dipCurl = clamp(
-    Math.max(dipAngle * 1.2, contraction * ROBOT_LIMITS.fingerDip[1]),
+    dipAngle * 1.12,
     ROBOT_LIMITS.fingerDip[0],
     ROBOT_LIMITS.fingerDip[1]
   );
@@ -406,28 +407,24 @@ function computeIndependentThumb(
   const vIpTip = { x: tip.x - ip.x, y: tip.y - ip.y, z: (tip.z ?? 0) - (ip.z ?? 0) };
 
   // Thumb MCP bend: angle between CMC->MCP and MCP->IP
-  const mcpBend = Math.max(0, angleBetweenVectors(vCmcMcp, vMcpIp) - 0.15);
+  const mcpBend = Math.max(0, angleBetweenVectors(vCmcMcp, vMcpIp) - 0.12);
   // Thumb IP bend: angle between MCP->IP and IP->TIP
   const ipBend = angleBetweenVectors(vMcpIp, vIpTip);
-
-  // Distance from thumb tip to base of index finger (MCP 5) measures opposition/curl
-  const idxMcp = landmarks[5];
-  const palmScale = Math.hypot(landmarks[9].x - w.x, landmarks[9].y - w.y) || 0.1;
-  const oppDist = Math.hypot(tip.x - idxMcp.x, tip.y - idxMcp.y) / palmScale;
-  const oppCurl = clamp((1.30 - oppDist) / 0.75, 0.0, 1.0);
+  // Distal tip bend
+  const dipBend = angleBetweenVectors(vMcpIp, vIpTip) * 0.85;
 
   const mcpCurl = clamp(
-    Math.max(mcpBend * 1.35, oppCurl * ROBOT_LIMITS.fingerMcp[1]),
+    mcpBend * 1.25,
     ROBOT_LIMITS.fingerMcp[0],
     ROBOT_LIMITS.fingerMcp[1]
   );
   const pipCurl = clamp(
-    Math.max(ipBend * 1.35, oppCurl * ROBOT_LIMITS.fingerPip[1]),
+    ipBend * 1.25,
     ROBOT_LIMITS.fingerPip[0],
     ROBOT_LIMITS.fingerPip[1]
   );
   const dipCurl = clamp(
-    Math.max(ipBend * 0.95, oppCurl * ROBOT_LIMITS.fingerDip[1]),
+    dipBend * 1.1,
     ROBOT_LIMITS.fingerDip[0],
     ROBOT_LIMITS.fingerDip[1]
   );
@@ -589,6 +586,7 @@ export function retargetHumanPose(
     left?: import('../robot/robotModel').ArmJointVelocities;
     right?: import('../robot/robotModel').ArmJointVelocities;
   };
+  kinematicDebug?: KinematicDebugData;
 } {
   const nose = poseLandmarks[0];
   const lShoulder = poseLandmarks[11];
@@ -662,39 +660,149 @@ export function retargetHumanPose(
   // ------------------------------------------------------------------------
   // INDEPENDENT LEFT & RIGHT ARM INPUT STREAMS
   // ------------------------------------------------------------------------
-  const hasWorldLandmarks = Boolean(worldLandmarks && worldLandmarks.length >= 25);
-
-  // LEFT ARM STREAM (strictly isolated from right arm and right hand)
-  const lShoulderPt = (hasWorldLandmarks && !leftFusedWrist ? worldLandmarks![11] : lShoulder) || lShoulder;
-  const lElbowPt = (hasWorldLandmarks && !leftFusedWrist ? worldLandmarks![13] : lElbow) || lElbow;
-  const lWristPt = leftFusedWrist || (hasWorldLandmarks ? worldLandmarks![15] : lWrist) || lWrist;
+  // Use unified continuous normalized landmark coordinates across shoulder, elbow,
+  // and wrist. When hand tracking detects wrist landmarks (leftFusedWrist/rightFusedWrist),
+  // they fuse seamlessly at the exact same coordinate frame without frame-to-frame jumping.
+  const lShoulderPt = lShoulder;
+  const lElbowPt = lElbow;
+  const lWristPt = leftFusedWrist || lWrist;
   const lSource: 'HAND' | 'POSE' | 'NONE' = leftFusedWrist ? 'HAND' : lWristPt ? 'POSE' : 'NONE';
-  const lIsMetric = hasWorldLandmarks && !leftFusedWrist;
 
   const lIK = retargetIKSolverLeft.solveFromLandmarks(
     lShoulderPt,
     lElbowPt,
     lWristPt,
     motionGain,
-    lIsMetric,
+    false,
     timestampMs
   );
 
   // RIGHT ARM STREAM (strictly isolated from left arm and left hand)
-  const rShoulderPt = (hasWorldLandmarks && !rightFusedWrist ? worldLandmarks![12] : rShoulder) || rShoulder;
-  const rElbowPt = (hasWorldLandmarks && !rightFusedWrist ? worldLandmarks![14] : rElbow) || rElbow;
-  const rWristPt = rightFusedWrist || (hasWorldLandmarks ? worldLandmarks![16] : rWrist) || rWrist;
+  const rShoulderPt = rShoulder;
+  const rElbowPt = rElbow;
+  const rWristPt = rightFusedWrist || rWrist;
   const rSource: 'HAND' | 'POSE' | 'NONE' = rightFusedWrist ? 'HAND' : rWristPt ? 'POSE' : 'NONE';
-  const rIsMetric = hasWorldLandmarks && !rightFusedWrist;
 
   const rIK = retargetIKSolverRight.solveFromLandmarks(
     rShoulderPt,
     rElbowPt,
     rWristPt,
     motionGain,
-    rIsMetric,
+    false,
     timestampMs
   );
+
+  // ------------------------------------------------------------------------
+  // KINEMATIC DEBUG VISUALIZER & COORDINATE FRAME ALIGNMENT
+  // Computes dot product values for arm extension vectors and normalizes the
+  // vector between shoulder and elbow joints to ensure the Z-axis aligns with
+  // the forward reach direction (+Z forward) of the humanoid robot.
+  // ------------------------------------------------------------------------
+  // Convert from camera screen frame to robot local frame:
+  // X: -(dx) to mirror user horizontal movement to robot
+  // Y: -(dy) to flip vertical image axis so +Y is up
+  // Z: -(dz) to invert MediaPipe depth so forward reach is +Z
+  const vUpperL = {
+    x: -(lElbowPt.x - lShoulderPt.x),
+    y: -(lElbowPt.y - lShoulderPt.y),
+    z: -((lElbowPt.z ?? 0) - (lShoulderPt.z ?? 0)),
+  };
+  const vForearmL = {
+    x: -(lWristPt.x - lElbowPt.x),
+    y: -(lWristPt.y - lElbowPt.y),
+    z: -((lWristPt.z ?? 0) - (lElbowPt.z ?? 0)),
+  };
+  const vReachL = {
+    x: -(lWristPt.x - lShoulderPt.x),
+    y: -(lWristPt.y - lShoulderPt.y),
+    z: -((lWristPt.z ?? 0) - (lShoulderPt.z ?? 0)),
+  };
+  const lenUpperL = Math.hypot(vUpperL.x, vUpperL.y, vUpperL.z) || 1e-4;
+  const lenForearmL = Math.hypot(vForearmL.x, vForearmL.y, vForearmL.z) || 1e-4;
+  const normUpperL = {
+    x: vUpperL.x / lenUpperL,
+    y: vUpperL.y / lenUpperL,
+    z: vUpperL.z / lenUpperL,
+  };
+  const normForearmL = {
+    x: vForearmL.x / lenForearmL,
+    y: vForearmL.y / lenForearmL,
+    z: vForearmL.z / lenForearmL,
+  };
+  const dotL = normUpperL.x * normForearmL.x + normUpperL.y * normForearmL.y + normUpperL.z * normForearmL.z;
+
+  const vUpperR = {
+    x: -(rElbowPt.x - rShoulderPt.x),
+    y: -(rElbowPt.y - rShoulderPt.y),
+    z: -((rElbowPt.z ?? 0) - (rShoulderPt.z ?? 0)),
+  };
+  const vForearmR = {
+    x: -(rWristPt.x - rElbowPt.x),
+    y: -(rWristPt.y - rElbowPt.y),
+    z: -((rWristPt.z ?? 0) - (rElbowPt.z ?? 0)),
+  };
+  const vReachR = {
+    x: -(rWristPt.x - rShoulderPt.x),
+    y: -(rWristPt.y - rShoulderPt.y),
+    z: -((rWristPt.z ?? 0) - (rShoulderPt.z ?? 0)),
+  };
+  const lenUpperR = Math.hypot(vUpperR.x, vUpperR.y, vUpperR.z) || 1e-4;
+  const lenForearmR = Math.hypot(vForearmR.x, vForearmR.y, vForearmR.z) || 1e-4;
+  const normUpperR = {
+    x: vUpperR.x / lenUpperR,
+    y: vUpperR.y / lenUpperR,
+    z: vUpperR.z / lenUpperR,
+  };
+  const normForearmR = {
+    x: vForearmR.x / lenForearmR,
+    y: vForearmR.y / lenForearmR,
+    z: vForearmR.z / lenForearmR,
+  };
+  const dotR = normUpperR.x * normForearmR.x + normUpperR.y * normForearmR.y + normUpperR.z * normForearmR.z;
+
+  const kinematicDebug: KinematicDebugData = {
+    timestamp: timestampMs ?? performance.now(),
+    leftArm: {
+      upperForearmDot: parseFloat(dotL.toFixed(4)),
+      extensionVector: {
+        x: parseFloat(vReachL.x.toFixed(4)),
+        y: parseFloat(vReachL.y.toFixed(4)),
+        z: parseFloat(vReachL.z.toFixed(4)),
+      },
+      shoulderToWristDistance: parseFloat(Math.hypot(vReachL.x, vReachL.y, vReachL.z).toFixed(4)),
+      finalShoulderZ: parseFloat(lIK.shoulderZ.toFixed(4)),
+      finalShoulderX: parseFloat(lIK.shoulderX.toFixed(4)),
+      finalShoulderY: parseFloat(lIK.shoulderY.toFixed(4)),
+      finalElbow: parseFloat(lIK.elbow.toFixed(4)),
+    },
+    rightArm: {
+      upperForearmDot: parseFloat(dotR.toFixed(4)),
+      extensionVector: {
+        x: parseFloat(vReachR.x.toFixed(4)),
+        y: parseFloat(vReachR.y.toFixed(4)),
+        z: parseFloat(vReachR.z.toFixed(4)),
+      },
+      shoulderToWristDistance: parseFloat(Math.hypot(vReachR.x, vReachR.y, vReachR.z).toFixed(4)),
+      finalShoulderZ: parseFloat(rIK.shoulderZ.toFixed(4)),
+      finalShoulderX: parseFloat(rIK.shoulderX.toFixed(4)),
+      finalShoulderY: parseFloat(rIK.shoulderY.toFixed(4)),
+      finalElbow: parseFloat(rIK.elbow.toFixed(4)),
+    },
+  };
+
+  latestKinematicDebug = kinematicDebug;
+
+  // Throttled logging (once every 600ms) to allow verifying inversion stage
+  const now = timestampMs ?? performance.now();
+  if (now - lastDebugLogTime > 600) {
+    lastDebugLogTime = now;
+    console.log('[Kinematic Debug Visualizer]', {
+      L_ExtensionDot: kinematicDebug.leftArm.upperForearmDot,
+      L_ShoulderZ: kinematicDebug.leftArm.finalShoulderZ,
+      R_ExtensionDot: kinematicDebug.rightArm.upperForearmDot,
+      R_ShoulderZ: kinematicDebug.rightArm.finalShoulderZ,
+    });
+  }
 
   return {
     headYaw,
@@ -732,6 +840,7 @@ export function retargetHumanPose(
       leftPenetration: lIK.deflectionDistance,
       rightPenetration: rIK.deflectionDistance,
     },
+    kinematicDebug,
   };
 }
 

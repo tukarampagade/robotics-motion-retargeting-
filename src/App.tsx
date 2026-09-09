@@ -8,10 +8,13 @@ import * as THREE from 'three';
 import {
   AppSettings,
   CalibrationData,
+  DEFAULT_ROBOT_CONFIG,
   GestureType,
   HandFingersState,
   HandTrackingState,
-  PickableObject,
+  InputSource,
+  RobotCommand,
+  RobotControlConfig,
   RobotJointAngles,
   TrackingMetrics,
 } from './types';
@@ -24,10 +27,6 @@ import {
   LabEnvironment,
   setupLabEnvironment,
 } from './robot/environment';
-import {
-  createPickAndPlaceStation,
-  PickPlaceStation,
-} from './robot/pickAndPlace';
 import { VisionManager } from './vision/visionManager';
 import {
   clamp,
@@ -40,13 +39,21 @@ import {
 import { DemoFrame, generateDemoSequence } from './vision/demoPlayer';
 import { MotionTrailsManager } from './robot/motionTrails';
 import { SaccadeEngine } from './robot/saccadeEngine';
-import { Header } from './components/Header';
+import { StreamlinedHeader, WorkspaceLayout } from './components/StreamlinedHeader';
+import { Sidebar, ActiveNavTab } from './components/Sidebar';
+import { Footer } from './components/Footer';
+import { KinematicsPanel } from './components/KinematicsPanel';
+import { GestureCommandCenter } from './components/GestureCommandCenter';
+import { CustomizationPanel, AccentColorTheme } from './components/CustomizationPanel';
 import { CameraView } from './components/CameraView';
 import { RobotViewport } from './components/RobotViewport';
-import { PickPlacePanel } from './components/PickPlacePanel';
-import { DebugDrawer } from './components/DebugDrawer';
+import { HandSignController } from './components/HandSignController';
+import { GestureStatus } from './components/GestureStatus';
 import { CalibrationModal } from './components/CalibrationModal';
 import { SettingsModal } from './components/SettingsModal';
+import { HandDebugPanel } from './components/HandDebugPanel';
+import { useRobotCommand } from './hooks/useRobotCommand';
+import { useHandGestureRecognition } from './hooks/useHandGestureRecognition';
 
 // Shortest angular difference interpolation to prevent 360-degree Euler wrapping and flipping through zero
 function lerpAngle(current: number, target: number, alpha: number): number {
@@ -80,7 +87,6 @@ export default function App() {
   // Three.js & Vision instances
   const envRef = useRef<LabEnvironment | null>(null);
   const robotRigRef = useRef<HumanoidRobotRig | null>(null);
-  const pickPlaceStationRef = useRef<PickPlaceStation | null>(null);
   const visionManagerRef = useRef<VisionManager | null>(null);
   const motionTrailsRef = useRef<MotionTrailsManager | null>(null);
 
@@ -88,43 +94,16 @@ export default function App() {
   const lastGestureRef = useRef<GestureType>('—');
   const lastResponseRef = useRef<string>('IDLE');
   const lastUiStateUpdateTimeRef = useRef<number>(0);
-  const lastPickPlaceStatusRef = useRef<string>('STATION READY');
-  const lastHeldObjectRef = useRef<PickableObject | null>(null);
 
   // Application State
   const [mode, setMode] = useState<'LIVE' | 'DEMO' | 'CALIBRATING'>('LIVE');
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
-  const [robotResponseState, setRobotResponseState] = useState<string>('IDLE');
-  const [currentGesture, setCurrentGesture] = useState<GestureType>('—');
-  const [pickPlaceStatus, setPickPlaceStatus] = useState<string>('STATION READY');
-  const [heldObject, setHeldObject] = useState<PickableObject | null>(null);
-  const [placedCount, setPlacedCount] = useState<number>(0);
-
-  // Modals & Panels
-  const [isPickPlacePanelOpen, setIsPickPlacePanelOpen] = useState<boolean>(false);
-  const [isDebugOpen, setIsDebugOpen] = useState<boolean>(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
-
-  // Calibration State
-  const [calibration, setCalibration] = useState<CalibrationData>({
-    isCalibrating: false,
-    progress: 0,
-    shoulderWidthRef: 0.25,
-    armLengthRef: 0.55,
-    neutralHead: { yaw: 0, pitch: 0 },
-    samplesCount: 0,
-    isDone: false,
-  });
-  const calibrationSamplesRef = useRef<number[]>([]);
-  const isCalibratingRef = useRef(calibration.isCalibrating);
-  useEffect(() => {
-    isCalibratingRef.current = calibration.isCalibrating;
-  }, [calibration.isCalibrating]);
-
-  const modeRef = useRef(mode);
-  useEffect(() => {
-    modeRef.current = mode;
-  }, [mode]);
+  const [isCameraLoading, setIsCameraLoading] = useState<boolean>(false);
+  const [isVideoSource, setIsVideoSource] = useState<boolean>(false);
+  const [isVideoPlaying, setIsVideoPlaying] = useState<boolean>(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [visionModelStatus, setVisionModelStatus] = useState<'unloaded' | 'loading' | 'ready' | 'error'>('ready');
+  const [visionModelMessage, setVisionModelMessage] = useState<string>('');
 
   // Settings State
   const [settings, setSettings] = useState<AppSettings>({
@@ -135,7 +114,7 @@ export default function App() {
     showFingers: true,
     poseModelQuality: 'lite', // Ultra-fast 30+ FPS pose tracking
     cameraView: 'front',
-    enablePickPlace: true,
+    enableHandSignControl: true,
     enableDebug: false,
     soundEnabled: true,
     soundVolume: 0.55,
@@ -168,6 +147,105 @@ export default function App() {
       visionManagerRef.current.setUseOneEuroFilter(settings.enableOneEuroFilter);
     }
   }, [settings]);
+
+  // Robot Control Configuration State
+  const [robotConfig, setRobotConfig] = useState<RobotControlConfig>(DEFAULT_ROBOT_CONFIG);
+
+  // Robot Hand-Sign Control Hook & Watchdog Safety System
+  const {
+    activeCommand,
+    setCommand,
+    triggerEmergencyStop,
+    resetEmergencyStop,
+    isEmergencyStopped,
+    connectionStatus,
+    lastCommandLatencyMs,
+    driveState,
+    driveStateRef,
+  } = useRobotCommand({
+    config: robotConfig,
+    enabled: settings.enableHandSignControl,
+  });
+
+  // MediaPipe Hand Gesture Recognition Hook (3 consecutive frames stability filter)
+  const {
+    stableGesture,
+    isHandDetected,
+    processFrame,
+    resetGestureState,
+    candidateCount,
+  } = useHandGestureRecognition({
+    config: robotConfig,
+  });
+
+  const processFrameRef = useRef(processFrame);
+  useEffect(() => {
+    processFrameRef.current = processFrame;
+  }, [processFrame]);
+
+  // Connect stable recognized hand signs to robot command engine
+  useEffect(() => {
+    if (stableGesture && settings.enableHandSignControl && mode === 'LIVE') {
+      setCommand(stableGesture.command, 'hand_gesture', stableGesture.confidence);
+    }
+  }, [stableGesture, setCommand, mode]);
+
+  const [robotResponseState, setRobotResponseState] = useState<string>('IDLE');
+  const [currentGesture, setCurrentGesture] = useState<GestureType>('—');
+
+  // Modals & Panels
+  const [isDebugOpen, setIsDebugOpen] = useState<boolean>(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+
+  // Desktop UI Navigation, Layout & Appearance
+  const [activeNavTab, setActiveNavTab] = useState<ActiveNavTab>('studio');
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
+  const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>('split');
+  const [accentColor, setAccentColor] = useState<AccentColorTheme>('cyan');
+  // Calibration State
+  const [calibration, setCalibration] = useState<CalibrationData>({
+    isCalibrating: false,
+    progress: 0,
+    shoulderWidthRef: 0.25,
+    armLengthRef: 0.55,
+    neutralHead: { yaw: 0, pitch: 0 },
+    samplesCount: 0,
+    isDone: false,
+  });
+  const calibrationSamplesRef = useRef<number[]>([]);
+  const isCalibratingRef = useRef(calibration.isCalibrating);
+  useEffect(() => {
+    isCalibratingRef.current = calibration.isCalibrating;
+  }, [calibration.isCalibrating]);
+
+  const modeRef = useRef(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  // Hand Neutral Calibration State
+  const [handCalibration, setHandCalibration] = useState<{
+    isCalibrating: boolean;
+    progress: number;
+  }>({
+    isCalibrating: false,
+    progress: 0,
+  });
+
+  const handleCalibrateHand = async (side: 'left' | 'right' | 'both' = 'both') => {
+    if (!isCameraActive) {
+      await handleStartCamera();
+    }
+    if (!visionManagerRef.current) return;
+    setHandCalibration({ isCalibrating: true, progress: 0 });
+    visionManagerRef.current.startHandCalibration(side);
+  };
+
+  const handleResetHandCalibration = () => {
+    if (!visionManagerRef.current) return;
+    visionManagerRef.current.resetHandCalibration();
+    setHandCalibration({ isCalibrating: false, progress: 0 });
+  };
 
   // Autonomous Saccade Engine ref & active scanning indicator
   const saccadeEngineRef = useRef<SaccadeEngine>(new SaccadeEngine(true));
@@ -240,10 +318,6 @@ export default function App() {
     const robotRig = createHumanoidRobot();
     robotRigRef.current = robotRig;
     env.scene.add(robotRig.root);
-
-    // Build pick and place virtual table & objects
-    const station = createPickAndPlaceStation(env.scene);
-    pickPlaceStationRef.current = station;
 
     // Build 3D hand motion trails manager
     const motionTrails = new MotionTrailsManager(env.scene);
@@ -509,31 +583,11 @@ export default function App() {
           );
         }
 
-        // Pick & Place Physics & Station
-        if (pickPlaceStationRef.current && currentSettings.enablePickPlace) {
-          const isLeftGrip =
-            leftFingersRef.current.index.mcp > 0.8 && leftFingersRef.current.middle.mcp > 0.8;
-          const isRightGrip =
-            rightFingersRef.current.index.mcp > 0.8 && rightFingersRef.current.middle.mcp > 0.8;
-
-          const res = pickPlaceStationRef.current.update(
-            leftHandPos,
-            rightHandPos,
-            isLeftGrip,
-            isRightGrip
-          );
-
-          if (lastPickPlaceStatusRef.current !== res.statusText) {
-            lastPickPlaceStatusRef.current = res.statusText;
-            setPickPlaceStatus(res.statusText);
-          }
-          if (lastHeldObjectRef.current !== res.heldObject) {
-            lastHeldObjectRef.current = res.heldObject;
-            setHeldObject(res.heldObject);
-          }
-          if (res.justPlaced) {
-            setPlacedCount(c => c + 1);
-          }
+        // Mobile Robot Locomotion & Physics Simulation (driven by hand sign commands)
+        if (robotRigRef.current && currentSettings.enableHandSignControl) {
+          robotRigRef.current.root.position.x = driveStateRef.current.x;
+          robotRigRef.current.root.position.z = driveStateRef.current.z;
+          robotRigRef.current.root.rotation.y = driveStateRef.current.rotationY;
         }
       }
 
@@ -587,6 +641,24 @@ export default function App() {
           targetRightFingersRef.current = data.rightHand.fingers;
         }
 
+        // Feed dominant hand landmarks to Hand-Sign Robot Control
+        const dominantHand =
+          data.rightHand.detected && data.rightHand.landmarks
+            ? data.rightHand
+            : data.leftHand.detected && data.leftHand.landmarks
+            ? data.leftHand
+            : null;
+
+        if (dominantHand && dominantHand.landmarks) {
+          processFrameRef.current?.(
+            dominantHand.landmarks,
+            dominantHand.confidence,
+            settingsRef.current.mirrorView
+          );
+        } else {
+          processFrameRef.current?.(null, 0, settingsRef.current.mirrorView);
+        }
+
         // Determine state label
         let nextResponse = 'STANDBY';
         if (data.gesture === 'WAVE') {
@@ -630,6 +702,8 @@ export default function App() {
             faceConfidence: data.metrics.faceConfidence,
             activeArmSource: data.metrics.activeArmSource,
             boundaryDeflected: data.metrics.boundaryDeflected,
+            kinematicDebug: data.metrics.kinematicDebug,
+            handCalibration: data.metrics.handCalibration,
           }));
         }
 
@@ -721,6 +795,16 @@ export default function App() {
           });
         }
       },
+      onCalibrationProgress: progress => {
+        setHandCalibration(c => ({ ...c, progress }));
+      },
+      onCalibrationComplete: () => {
+        setHandCalibration({ isCalibrating: false, progress: 100 });
+      },
+      onModelStatusChange: (status, message) => {
+        setVisionModelStatus(status);
+        if (message) setVisionModelMessage(message);
+      },
     });
 
     visionManagerRef.current = vision;
@@ -728,46 +812,124 @@ export default function App() {
   }, []);
 
   // -------------------------------------------------------------
-  // 4. Start Webcam Feed
+  // 4. Start Webcam Feed & Video Media Handler
   // -------------------------------------------------------------
   const handleStartCamera = async () => {
     if (!videoRef.current || !visionManagerRef.current) return;
 
     try {
-      // Initialize vision models (Full or Lite)
-      await visionManagerRef.current.initialize(settings.poseModelQuality);
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640, max: 640 },
-          height: { ideal: 480, max: 480 },
-          frameRate: { ideal: 30, max: 60 },
-          facingMode: 'user',
-        },
-        audio: false,
-      });
+      setIsCameraLoading(true);
+      setCameraError(null);
 
       const video = videoRef.current;
+      // Clean up previous blob URL if exists
+      if (video.src && video.src.startsWith('blob:')) {
+        URL.revokeObjectURL(video.src);
+        video.src = '';
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+          'Webcam access is not supported or is restricted in this browser frame. Please try opening the app in a new browser tab, or use the Video Upload / Simulated Motion Demo modes below.'
+        );
+      }
+
+      // Request stream first so user is prompted immediately
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 30, max: 60 },
+            facingMode: 'user',
+          },
+          audio: false,
+        });
+      } catch (constraintErr) {
+        console.warn('Ideal constraints failed, attempting fallback to basic video:', constraintErr);
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
+
       video.srcObject = stream;
-      await video.play();
+      video.muted = true;
+      video.playsInline = true;
+
+      await new Promise<void>((resolve) => {
+        const onLoaded = () => {
+          video.removeEventListener('loadeddata', onLoaded);
+          resolve();
+        };
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          resolve();
+        } else {
+          video.addEventListener('loadeddata', onLoaded);
+          setTimeout(resolve, 800);
+        }
+      });
+
+      await video.play().catch(e => console.warn('Video play warning:', e));
 
       if (overlayCanvasRef.current) {
         overlayCanvasRef.current.width = video.videoWidth || 640;
         overlayCanvasRef.current.height = video.videoHeight || 480;
       }
 
+      // Initialize vision models (Full or Lite)
+      await visionManagerRef.current.initialize(settings.poseModelQuality);
+
       setIsCameraActive(true);
+      setIsVideoSource(false);
+      setIsVideoPlaying(true);
       setMode('LIVE');
+      setIsCameraLoading(false);
 
       // Start asynchronous, non-blocking vision loop
       visionManagerRef.current.start(video);
     } catch (err: any) {
       console.error('Error starting camera:', err);
-      alert(
-        'Could not access webcam: ' +
-          (err.message || 'Please check browser camera permissions and try again.')
-      );
+      setIsCameraLoading(false);
+      const msg =
+        err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError'
+          ? 'Camera permission was denied. Please allow camera access in your browser settings (look for the lock icon in the address bar).'
+          : err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError'
+          ? 'No camera found. Please attach a webcam or use the Video Upload / Demo modes.'
+          : err.name === 'NotReadableError' || err.name === 'TrackStartError'
+          ? 'Camera is in use by another application or browser tab.'
+          : err.message || 'Could not access webcam.';
+      setCameraError(msg);
     }
+  };
+
+  const handleToggleVideoPlay = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) {
+      video.play().then(() => {
+        setIsVideoPlaying(true);
+        if (visionManagerRef.current) {
+          visionManagerRef.current.start(video);
+        }
+      });
+    } else {
+      video.pause();
+      setIsVideoPlaying(false);
+    }
+  };
+
+  const handleRestartVideo = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = 0;
+    video.play().then(() => {
+      setIsVideoPlaying(true);
+      if (visionManagerRef.current) {
+        visionManagerRef.current.start(video);
+      }
+    });
   };
 
   // Toggle Mirror View
@@ -817,127 +979,327 @@ export default function App() {
     }
   };
 
+  // Stop or restart camera stream
+  const handleToggleCamera = async () => {
+    if (isCameraActive) {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+      visionManagerRef.current?.stop();
+      setIsCameraActive(false);
+      if (mode === 'LIVE') setMode('DEMO');
+    } else {
+      await handleStartCamera();
+    }
+  };
+
+  // Reset robot posture to upright home position
+  const handleResetPose = () => {
+    targetAnglesRef.current = freshRobotJointAngles();
+    currentAnglesRef.current = freshRobotJointAngles();
+    prevAnglesRef.current = freshRobotJointAngles();
+    targetLeftFingersRef.current = freshHandFingers();
+    targetRightFingersRef.current = freshHandFingers();
+    leftFingersRef.current = freshHandFingers();
+    rightFingersRef.current = freshHandFingers();
+  };
+
+  // Keyboard shortcut navigation
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+      if (e.key === '[') {
+        setIsSidebarCollapsed(v => !v);
+      } else if (e.key === 'd' || e.key === 'D') {
+        handleToggleDemo();
+      } else if (e.key === 'c' || e.key === 'C') {
+        handleStartCalibration();
+      } else if (e.key === '1') {
+        setWorkspaceLayout('split');
+      } else if (e.key === '2') {
+        setWorkspaceLayout('3d-solo');
+      } else if (e.key === '3') {
+        setWorkspaceLayout('cam-solo');
+      } else if (e.key === 'Escape') {
+        setIsSettingsOpen(false);
+        if (activeNavTab !== 'studio') {
+          setActiveNavTab('studio');
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [activeNavTab]);
+
   return (
-    <div className="flex flex-col w-screen h-screen overflow-hidden bg-[#f4f7fa] font-sans antialiased text-slate-800 select-none">
-      {/* Top Application Header */}
-      <Header
+    <div className="flex flex-col w-screen h-screen overflow-hidden bg-slate-50 font-sans antialiased text-slate-800 select-none">
+      {/* Top Streamlined Header with essential controls */}
+      <StreamlinedHeader
+        mode={mode}
+        isCameraActive={isCameraActive}
+        workspaceLayout={workspaceLayout}
+        onSetWorkspaceLayout={setWorkspaceLayout}
+        onToggleCamera={handleToggleCamera}
+        onToggleDemo={handleToggleDemo}
+        onResetPose={handleResetPose}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        isDebugOpen={isDebugOpen || activeNavTab === 'debug'}
+        onToggleDebug={() => {
+          if (activeNavTab === 'debug') {
+            setActiveNavTab('studio');
+            setIsDebugOpen(false);
+          } else {
+            setActiveNavTab('debug');
+            setIsDebugOpen(true);
+          }
+        }}
+        activeRobotCommand={activeCommand}
+        onEmergencyStop={triggerEmergencyStop}
+        isEmergencyStopped={isEmergencyStopped}
+        soundEnabled={settings.soundEnabled}
+        onToggleSound={() => setSettings(s => ({ ...s, soundEnabled: !s.soundEnabled }))}
+        accentColor={accentColor}
+        metrics={metrics}
+      />
+
+      {/* Main Workspace: Collapsible Sidebar + Spacious Content Area */}
+      <div className="flex-1 flex min-h-0 relative overflow-hidden">
+        {/* Collapsible Main Navigation Sidebar */}
+        <Sidebar
+          activeTab={activeNavTab}
+          onSelectTab={tab => {
+            setActiveNavTab(tab);
+            if (tab === 'calibration') {
+              handleStartCalibration();
+            }
+          }}
+          isCollapsed={isSidebarCollapsed}
+          onToggleCollapse={() => setIsSidebarCollapsed(v => !v)}
+          isCameraActive={isCameraActive}
+          mode={mode}
+          currentGesture={currentGesture}
+          activeRobotCommand={activeCommand}
+          accentColor={accentColor}
+        />
+
+        {/* Spacious Content Area with Clear Visual Hierarchy */}
+        <main className="flex-1 flex min-h-0 min-w-0 relative bg-slate-100 overflow-hidden">
+          {/* Primary Viewports Container */}
+          <div className="flex-1 flex h-full min-h-0 min-w-0 relative">
+            {/* Left: Human Vision Feed (Adjusts smoothly based on layout) */}
+            <div
+              className={`${
+                workspaceLayout === '3d-solo'
+                  ? 'hidden'
+                  : workspaceLayout === 'cam-solo'
+                  ? 'flex-1 h-full'
+                  : 'w-[35%] min-w-[280px] max-w-[500px] h-full shrink-0 border-r border-slate-200'
+              } transition-all duration-150 relative`}
+            >
+              <CameraView
+                videoRef={videoRef}
+                overlayCanvasRef={overlayCanvasRef}
+                isCameraActive={isCameraActive}
+                isCameraLoading={isCameraLoading}
+                isMirrorMode={settings.mirrorView}
+                gesture={currentGesture}
+                leftHand={leftHandState}
+                rightHand={rightHandState}
+                metrics={metrics}
+                poseConfidenceThreshold={settings.poseConfidenceThreshold}
+                onToggleMirror={handleToggleMirror}
+                onStartCamera={handleStartCamera}
+                onStartDemoMode={handleToggleDemo}
+                isVideoSource={isVideoSource}
+                isVideoPlaying={isVideoPlaying}
+                onToggleVideoPlay={handleToggleVideoPlay}
+                onRestartVideo={handleRestartVideo}
+                isCalibrating={handCalibration.isCalibrating}
+                calibrationProgress={handCalibration.progress}
+                onStartCalibration={() => handleCalibrateHand('both')}
+                onCancelCalibration={handleResetHandCalibration}
+                cameraError={cameraError}
+                onDismissCameraError={() => setCameraError(null)}
+                visionModelStatus={visionModelStatus}
+                visionModelMessage={visionModelMessage}
+              />
+            </div>
+
+            {/* Right: 3D Robot Simulation Canvas */}
+            <div
+              className={`${
+                workspaceLayout === 'cam-solo' ? 'hidden' : 'flex-1 h-full min-w-0 relative'
+              } transition-all duration-150`}
+            >
+              <RobotViewport
+                canvasRef={robotCanvasRef}
+                robotResponseState={robotResponseState}
+                gesture={currentGesture}
+                cameraPreset={settings.cameraView}
+                activeRobotCommand={activeCommand}
+                isEmergencyStopped={isEmergencyStopped}
+                driveSpeed={driveState.speed}
+                showGestureGuide={settings.showGestureGuide}
+                motionTrailsEnabled={settings.motionTrailsEnabled}
+                studioLightingEnabled={settings.studioLightingEnabled}
+                bodyBoundaryEnabled={settings.bodyBoundaryEnabled}
+                showBodyBoundaryShield={settings.showBodyBoundaryShield}
+                futuristicMode={settings.futuristicMode}
+                isDeflectedLeft={boundaryDeflection.left}
+                isDeflectedRight={boundaryDeflection.right}
+                isSaccading={isSaccadingActive}
+                onSetCameraPreset={preset => {
+                  setSettings(s => ({ ...s, cameraView: preset }));
+                  envRef.current?.setCameraPreset(preset);
+                }}
+                onEmergencyStop={triggerEmergencyStop}
+                onToggleGestureGuide={handleToggleGestureGuide}
+                onToggleMotionTrails={handleToggleMotionTrails}
+                onToggleStudioLighting={() =>
+                  setSettings(s => ({ ...s, studioLightingEnabled: !s.studioLightingEnabled }))
+                }
+                onToggleBodyBoundary={() =>
+                  setSettings(s => ({ ...s, bodyBoundaryEnabled: !s.bodyBoundaryEnabled }))
+                }
+                onToggleShield={() =>
+                  setSettings(s => ({ ...s, showBodyBoundaryShield: !s.showBodyBoundaryShield }))
+                }
+                onToggleFuturistic={() =>
+                  setSettings(s => ({ ...s, futuristicMode: !s.futuristicMode }))
+                }
+              />
+
+              {/* Floating Hand-Sign Teleoperation HUD in Viewport */}
+              <div className="absolute top-3 left-3 z-20 pointer-events-auto">
+                <GestureStatus
+                  gestureResult={stableGesture}
+                  isHandDetected={isHandDetected}
+                  minConfidence={robotConfig.minGestureConfidence}
+                  candidateCount={candidateCount}
+                  requiredFrames={robotConfig.stabilityFrames}
+                />
+              </div>
+
+              {/* Floating Picture-in-Picture Mini Camera View when 3D is Solo */}
+              {workspaceLayout === '3d-solo' && isCameraActive && (
+                <div className="absolute bottom-4 left-4 w-48 h-36 rounded-2xl bg-white border border-slate-300 shadow-xl overflow-hidden z-30 transition-all hover:scale-105">
+                  <video
+                    playsInline
+                    muted
+                    autoPlay
+                    ref={el => {
+                      if (el && videoRef.current?.srcObject && el.srcObject !== videoRef.current.srcObject) {
+                        el.srcObject = videoRef.current.srcObject;
+                      }
+                    }}
+                    className="w-full h-full object-cover"
+                    style={{ transform: settings.mirrorView ? 'scaleX(-1)' : 'none' }}
+                  />
+                  <div className="absolute top-1.5 left-2 px-1.5 py-0.5 rounded bg-slate-900/80 text-white font-mono text-[9px] flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span>LIVE CAM</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Contextual Hand-Sign Robot Control Workspace when tab selected */}
+          {activeNavTab === 'handsign' && (
+            <div className="w-[440px] max-w-[90vw] h-full shrink-0 z-20 shadow-xl border-l border-slate-200 bg-white">
+              <HandSignController
+                gestureResult={stableGesture}
+                isHandDetected={isHandDetected}
+                activeCommand={activeCommand}
+                driveState={driveState}
+                connectionStatus={connectionStatus}
+                latencyMs={lastCommandLatencyMs}
+                config={robotConfig}
+                onUpdateConfig={newConfig => setRobotConfig(c => ({ ...c, ...newConfig }))}
+                onSetCommand={(cmd, src) => setCommand(cmd, src, 1.0)}
+                onEmergencyStop={triggerEmergencyStop}
+                onResetEmergencyStop={resetEmergencyStop}
+                isEmergencyStopped={isEmergencyStopped}
+                onClose={() => setActiveNavTab('studio')}
+              />
+            </div>
+          )}
+
+          {activeNavTab === 'kinematics' && (
+            <div className="w-96 h-full shrink-0 z-10">
+              <KinematicsPanel
+                angles={currentAnglesRef.current}
+                leftHand={leftHandState}
+                rightHand={rightHandState}
+                metrics={metrics}
+                onClose={() => setActiveNavTab('studio')}
+                accentColor={accentColor}
+              />
+            </div>
+          )}
+
+          {activeNavTab === 'gestures' && (
+            <div className="w-96 h-full shrink-0 z-10">
+              <GestureCommandCenter
+                currentGesture={currentGesture}
+                leftHand={leftHandState}
+                rightHand={rightHandState}
+                onClose={() => setActiveNavTab('studio')}
+                accentColor={accentColor}
+              />
+            </div>
+          )}
+
+          {activeNavTab === 'customization' && (
+            <div className="w-96 h-full shrink-0 z-10">
+              <CustomizationPanel
+                settings={settings}
+                onUpdateSettings={updates => {
+                  setSettings(s => ({ ...s, ...updates }));
+                  if (updates.cameraView && envRef.current) {
+                    envRef.current.setCameraPreset(updates.cameraView);
+                  }
+                }}
+                accentColor={accentColor}
+                onSetAccentColor={setAccentColor}
+                onClose={() => setActiveNavTab('studio')}
+              />
+            </div>
+          )}
+
+          {(activeNavTab === 'debug' || isDebugOpen) && (
+            <div className="w-[440px] max-w-[90vw] h-full shrink-0 z-20 shadow-xl border-l border-slate-200 bg-white">
+              <HandDebugPanel
+                leftHand={leftHandState}
+                rightHand={rightHandState}
+                metrics={metrics}
+                onCalibrate={handleCalibrateHand}
+                onResetCalibration={handleResetHandCalibration}
+                isCalibrating={handCalibration.isCalibrating}
+                calibrationProgress={handCalibration.progress}
+                onClose={() => {
+                  setIsDebugOpen(false);
+                  if (activeNavTab === 'debug') {
+                    setActiveNavTab('studio');
+                  }
+                }}
+              />
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* Minimal Footer with critical telemetry & status */}
+      <Footer
         metrics={metrics}
         mode={mode}
         isCameraActive={isCameraActive}
-        hasPose={metrics.poseConfidence > 0.4}
-        hasLeftHand={leftHandState.detected}
-        hasRightHand={rightHandState.detected}
-        enablePickPlace={settings.enablePickPlace}
-        enableDebug={isDebugOpen}
-        motionTrailsEnabled={settings.motionTrailsEnabled}
-        showGestureGuide={settings.showGestureGuide}
-        onToggleMotionTrails={handleToggleMotionTrails}
-        onToggleGestureGuide={handleToggleGestureGuide}
-        onTogglePickPlace={() => setIsPickPlacePanelOpen(v => !v)}
-        onToggleDebug={() => setIsDebugOpen(v => !v)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        onStartCalibration={handleStartCalibration}
-        onToggleDemo={handleToggleDemo}
-      />
-
-      {/* Main Split Layout: Left Camera | Right 3D Robot Viewport */}
-      <div className="flex-1 flex min-h-0 relative">
-        {/* Left Side: Human Vision Panel (35% width on desktop, collapsible) */}
-        <div className="w-[36%] min-w-[280px] max-w-[500px] h-full shrink-0 hidden sm:block">
-          <CameraView
-            videoRef={videoRef}
-            overlayCanvasRef={overlayCanvasRef}
-            isCameraActive={isCameraActive}
-            isMirrorMode={settings.mirrorView}
-            gesture={currentGesture}
-            leftHand={leftHandState}
-            rightHand={rightHandState}
-            metrics={metrics}
-            poseConfidenceThreshold={settings.poseConfidenceThreshold}
-            onToggleMirror={handleToggleMirror}
-            onStartCamera={handleStartCamera}
-          />
-        </div>
-
-        {/* Right Side: Large 3D Robot Viewport */}
-        <div className="flex-1 h-full min-w-0 relative">
-          <RobotViewport
-            canvasRef={robotCanvasRef}
-            robotResponseState={robotResponseState}
-            gesture={currentGesture}
-            cameraPreset={settings.cameraView}
-            enablePickPlace={settings.enablePickPlace}
-            pickPlaceStatus={pickPlaceStatus}
-            heldObject={heldObject}
-            placedCount={placedCount}
-            showGestureGuide={settings.showGestureGuide}
-            motionTrailsEnabled={settings.motionTrailsEnabled}
-            studioLightingEnabled={settings.studioLightingEnabled}
-            bodyBoundaryEnabled={settings.bodyBoundaryEnabled}
-            showBodyBoundaryShield={settings.showBodyBoundaryShield}
-            futuristicMode={settings.futuristicMode}
-            isDeflectedLeft={boundaryDeflection.left}
-            isDeflectedRight={boundaryDeflection.right}
-            isSaccading={isSaccadingActive}
-            onSetCameraPreset={preset => {
-              setSettings(s => ({ ...s, cameraView: preset }));
-              envRef.current?.setCameraPreset(preset);
-            }}
-            onResetPickPlace={() => pickPlaceStationRef.current?.resetObjects()}
-            onToggleGestureGuide={handleToggleGestureGuide}
-            onToggleMotionTrails={handleToggleMotionTrails}
-            onToggleStudioLighting={() =>
-              setSettings(s => ({ ...s, studioLightingEnabled: !s.studioLightingEnabled }))
-            }
-            onToggleBodyBoundary={() =>
-              setSettings(s => ({ ...s, bodyBoundaryEnabled: !s.bodyBoundaryEnabled }))
-            }
-            onToggleShield={() =>
-              setSettings(s => ({ ...s, showBodyBoundaryShield: !s.showBodyBoundaryShield }))
-            }
-            onToggleFuturistic={() =>
-              setSettings(s => ({ ...s, futuristicMode: !s.futuristicMode }))
-            }
-          />
-        </div>
-
-        {/* Mobile floating camera button if screen is small */}
-        <div className="sm:hidden absolute top-3 left-3 z-30">
-          {!isCameraActive ? (
-            <button
-              onClick={handleStartCamera}
-              className="px-3 py-1.5 rounded-lg bg-cyan-600 text-white text-xs font-semibold shadow-md"
-            >
-              Start Camera
-            </button>
-          ) : (
-            <span className="px-2 py-1 rounded bg-slate-900/80 text-white font-mono text-[10px]">
-              CAM ACTIVE
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* Pick & Place Floating Control Panel */}
-      <PickPlacePanel
-        isOpen={isPickPlacePanelOpen}
-        objects={pickPlaceStationRef.current?.objects || []}
-        activeObjectId={pickPlaceStationRef.current?.activeObjectId || 'box-01'}
-        pickPlaceStatus={pickPlaceStatus}
-        placedCount={placedCount}
-        onSelectObject={id => pickPlaceStationRef.current?.selectObject(id)}
-        onResetObjects={() => pickPlaceStationRef.current?.resetObjects()}
-        onClose={() => setIsPickPlacePanelOpen(false)}
-      />
-
-      {/* Live Telemetry Debug Inspector Drawer */}
-      <DebugDrawer
-        isOpen={isDebugOpen}
-        angles={currentAnglesRef.current}
-        leftHand={leftHandState}
-        rightHand={rightHandState}
-        metrics={metrics}
-        onClose={() => setIsDebugOpen(false)}
+        currentGesture={currentGesture}
+        robotResponseState={robotResponseState}
       />
 
       {/* Calibration Wizard Modal */}

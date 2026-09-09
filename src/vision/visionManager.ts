@@ -6,6 +6,8 @@
 import { FilesetResolver, PoseLandmarker, HandLandmarker } from '@mediapipe/tasks-vision';
 import {
   GestureType,
+  HandCalibrationProfile,
+  HandDebugTelemetry,
   HandFingersState,
   HandTrackingState,
   TrackingMetrics,
@@ -17,6 +19,12 @@ import {
   LandmarkPoint,
   retargetHumanPose,
 } from './motionRetargeter';
+import {
+  analyzeHandKinematics,
+  createDefaultCalibration,
+  FingerOcclusionTracker,
+  PinchDetector,
+} from './handKinematics';
 import { LandmarkOneEuroFilterSet } from './oneEuroFilter';
 
 export interface VisionCallbacks {
@@ -32,6 +40,9 @@ export interface VisionCallbacks {
     handLandmarks: LandmarkPoint[][] | null
   ) => void;
   onError?: (err: Error) => void;
+  onModelStatusChange?: (status: 'loading' | 'ready' | 'error', message?: string) => void;
+  onCalibrationProgress?: (progress: number) => void;
+  onCalibrationComplete?: (left: HandCalibrationProfile, right: HandCalibrationProfile) => void;
 }
 
 export class VisionManager {
@@ -66,6 +77,7 @@ export class VisionManager {
     wristOrientation: { roll: 0, pitch: 0, yaw: 0 },
     fingers: freshHandFingers(),
     gesture: '—',
+    palmSize: 0.08,
     pinchDistance: 1,
     isGrip: false,
   };
@@ -78,9 +90,30 @@ export class VisionManager {
     wristOrientation: { roll: 0, pitch: 0, yaw: 0 },
     fingers: freshHandFingers(),
     gesture: '—',
+    palmSize: 0.08,
     pinchDistance: 1,
     isGrip: false,
   };
+
+  // Independent Kinematics Processors
+  private leftPinchDetector: PinchDetector = new PinchDetector();
+  private rightPinchDetector: PinchDetector = new PinchDetector();
+  private leftOcclusionTracker: FingerOcclusionTracker = new FingerOcclusionTracker();
+  private rightOcclusionTracker: FingerOcclusionTracker = new FingerOcclusionTracker();
+
+  // Calibration Profiles
+  private leftCalibration: HandCalibrationProfile = createDefaultCalibration();
+  private rightCalibration: HandCalibrationProfile = createDefaultCalibration();
+
+  // Active calibration sampling state
+  private isCalibratingHand: boolean = false;
+  private calibrationSide: 'left' | 'right' | 'both' = 'both';
+  private calibrationSamples: Array<{
+    left?: HandFingersState;
+    right?: HandFingersState;
+    leftWidth?: number;
+    rightWidth?: number;
+  }> = [];
 
   private callbacks: VisionCallbacks;
   private poseQuality: 'full' | 'lite' = 'full';
@@ -97,6 +130,31 @@ export class VisionManager {
 
   constructor(callbacks: VisionCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  public startHandCalibration(side: 'left' | 'right' | 'both' = 'both') {
+    this.isCalibratingHand = true;
+    this.calibrationSide = side;
+    this.calibrationSamples = [];
+  }
+
+  public cancelHandCalibration() {
+    this.isCalibratingHand = false;
+    this.calibrationSamples = [];
+  }
+
+  public resetHandCalibration() {
+    this.leftCalibration = createDefaultCalibration();
+    this.rightCalibration = createDefaultCalibration();
+  }
+
+  public getHandCalibration(): { left: HandCalibrationProfile; right: HandCalibrationProfile } {
+    return { left: this.leftCalibration, right: this.rightCalibration };
+  }
+
+  public setHandCalibration(left: HandCalibrationProfile, right: HandCalibrationProfile) {
+    this.leftCalibration = left;
+    this.rightCalibration = right;
   }
 
   public setPoseConfidenceThreshold(th: number) {
@@ -126,44 +184,113 @@ export class VisionManager {
     }
   }
 
+  public isInitialized(): boolean {
+    return this.poseLandmarker !== null && this.handLandmarker !== null;
+  }
+
+  public resetTimestamps(): void {
+    this.lastTimestampMs = 0;
+    this.lastVideoTime = -1;
+    this.poseFilter.reset();
+    this.leftHandFilter.reset();
+    this.rightHandFilter.reset();
+  }
+
   public async initialize(quality: 'full' | 'lite' = 'lite'): Promise<void> {
+    if (this.poseLandmarker && this.handLandmarker && this.poseQuality === quality) {
+      return;
+    }
+
     this.poseQuality = quality;
+    if (this.callbacks.onModelStatusChange) {
+      this.callbacks.onModelStatusChange('loading', 'Loading MediaPipe vision tasks & models...');
+    }
+
     try {
-      this.visionResolver = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-      );
+      if (!this.visionResolver) {
+        try {
+          this.visionResolver = await FilesetResolver.forVisionTasks(
+            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm'
+          );
+        } catch (wasmErr) {
+          console.warn('WASM 1.0.1 load failed, using fallback:', wasmErr);
+          this.visionResolver = await FilesetResolver.forVisionTasks(
+            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+          );
+        }
+      }
 
       const poseModelPath =
         quality === 'lite'
           ? 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
           : 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
 
-      this.poseLandmarker = await PoseLandmarker.createFromOptions(this.visionResolver, {
-        baseOptions: {
-          modelAssetPath: poseModelPath,
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.35,
-        minPosePresenceConfidence: 0.35,
-        minTrackingConfidence: 0.35,
-      });
+      // Attempt GPU delegate first, gracefully fallback to CPU if unavailable
+      try {
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath: poseModelPath,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.35,
+          minTrackingConfidence: 0.35,
+        });
+      } catch (gpuErr) {
+        console.warn('GPU acceleration unavailable for PoseLandmarker, falling back to CPU:', gpuErr);
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath: poseModelPath,
+            delegate: 'CPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.35,
+          minTrackingConfidence: 0.35,
+        });
+      }
 
-      this.handLandmarker = await HandLandmarker.createFromOptions(this.visionResolver, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.25,
-        minHandPresenceConfidence: 0.25,
-        minTrackingConfidence: 0.25,
-      });
+      // Attempt GPU delegate for HandLandmarker, fallback to CPU
+      try {
+        this.handLandmarker = await HandLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.25,
+          minHandPresenceConfidence: 0.25,
+          minTrackingConfidence: 0.25,
+        });
+      } catch (gpuErr) {
+        console.warn('GPU acceleration unavailable for HandLandmarker, falling back to CPU:', gpuErr);
+        this.handLandmarker = await HandLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'CPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.25,
+          minHandPresenceConfidence: 0.25,
+          minTrackingConfidence: 0.25,
+        });
+      }
+
+      if (this.callbacks.onModelStatusChange) {
+        this.callbacks.onModelStatusChange('ready', 'MediaPipe vision models loaded');
+      }
     } catch (err: any) {
       console.error('Failed to initialize MediaPipe models:', err);
+      if (this.callbacks.onModelStatusChange) {
+        this.callbacks.onModelStatusChange('error', err.message || 'Failed to download or initialize vision models');
+      }
       if (this.callbacks.onError) {
         this.callbacks.onError(err);
       }
@@ -243,10 +370,12 @@ export class VisionManager {
     const currentPerf = performance.now();
     const videoTimeMs = Math.round(video.currentTime * 1000);
     const monotonicTimestamp = Math.max(
-      this.lastTimestampMs + 2,
+      this.lastTimestampMs + 4,
       videoTimeMs > 0 ? videoTimeMs : Math.round(currentPerf)
     );
-    this.lastTimestampMs = monotonicTimestamp;
+    const handTimestamp = monotonicTimestamp + 1;
+    const poseTimestamp = monotonicTimestamp + 2;
+    this.lastTimestampMs = poseTimestamp;
 
     const startTime = performance.now();
 
@@ -254,7 +383,7 @@ export class VisionManager {
     // HandLandmarker is processed first so hand wrist landmarks can be fused with pose
     let handResults: any = null;
     try {
-      handResults = this.handLandmarker.detectForVideo(video, monotonicTimestamp);
+      handResults = this.handLandmarker.detectForVideo(video, handTimestamp);
     } catch (e) {
       // Guard against momentary buffer loss during fast motion scenes
     }
@@ -262,7 +391,7 @@ export class VisionManager {
     // 2. Detect Pose Landmarks
     let poseResults: any = null;
     try {
-      poseResults = this.poseLandmarker.detectForVideo(video, monotonicTimestamp + 1);
+      poseResults = this.poseLandmarker.detectForVideo(video, poseTimestamp);
     } catch (e) {
       // Guard against momentary frame drop
     }
@@ -305,9 +434,16 @@ export class VisionManager {
       const assignedLabels: ('Left' | 'Right')[] = [];
 
       const calcArmProximityCost = (handWrist: LandmarkPoint, armSide: 'Left' | 'Right'): number => {
+        // Temporal tracking: distance from previous frame's hand position to prevent swapping during hand crossing
+        const prevHand = armSide === 'Left' ? this.leftHandState : this.rightHandState;
+        const distPrev = prevHand.detected
+          ? Math.hypot(handWrist.x - prevHand.wristPos.x, handWrist.y - prevHand.wristPos.y)
+          : 0.5;
+
         if (!pLm) {
           // Camera frame fallback without pose: user's Left is on right side of image (x > 0.5)
-          return armSide === 'Left' ? (handWrist.x > 0.5 ? 0.1 : 0.9) : (handWrist.x <= 0.5 ? 0.1 : 0.9);
+          const sideCost = armSide === 'Left' ? (handWrist.x > 0.5 ? 0.1 : 0.9) : (handWrist.x <= 0.5 ? 0.1 : 0.9);
+          return sideCost * 1.5 + distPrev * 2.0;
         }
         const shoulder = armSide === 'Left' ? pLm[11] : pLm[12];
         const elbow = armSide === 'Left' ? pLm[13] : pLm[14];
@@ -323,8 +459,8 @@ export class VisionManager {
           ? Math.hypot(handWrist.x - shoulder.x, handWrist.y - shoulder.y)
           : 0.9;
 
-        // Weight wrist proximity highest, then elbow chain continuity
-        return distWrist * 2.0 + distElbow * 0.8 + distShoulder * 0.3;
+        // Weight wrist proximity highest, temporal continuity, then elbow chain continuity
+        return distWrist * 2.2 + distPrev * 1.5 + distElbow * 0.8 + distShoulder * 0.3;
       };
 
       if (handResults.landmarks.length === 1) {
@@ -370,23 +506,40 @@ export class VisionManager {
         filteredHands.push(lm);
 
         const sign = label === 'Left' ? -1 : 1;
-        const worldLm = handResults.worldLandmarks?.[idx];
-        const analysis = analyzeHandLandmarks(lm, worldLm, sign);
+        const pinchDet = label === 'Left' ? this.leftPinchDetector : this.rightPinchDetector;
+        const occlTracker = label === 'Left' ? this.leftOcclusionTracker : this.rightOcclusionTracker;
+        const calProfile = label === 'Left' ? this.leftCalibration : this.rightCalibration;
+
+        const analysis = analyzeHandKinematics(
+          lm,
+          sign,
+          pinchDet,
+          occlTracker,
+          calProfile,
+          0.033
+        );
 
         if (label === 'Left') {
           lHandDetected = true;
           lConf = score;
-          leftFusedWrist = lm[0];
+          leftFusedWrist = {
+            x: lm[0].x,
+            y: lm[0].y,
+            z: pLm?.[15]?.z ?? lm[0].z ?? 0,
+          };
           this.leftHandState = {
             detected: true,
             confidence: score,
             rawLabel: rawLabel as any,
             wristPos: { x: lm[0].x, y: lm[0].y, z: lm[0].z ?? 0 },
             wristOrientation: analysis.wristOri,
-            fingers: analysis.fingers,
+            fingers: analysis.robotFingers,
             gesture: analysis.gesture,
-            pinchDistance: analysis.pinchDist,
-            isGrip: analysis.isGrip,
+            palmSize: analysis.palmSize,
+            pinchDistance: analysis.pinchDistance,
+            isGrip: analysis.isPinch || analysis.gesture === 'FIST',
+            debugTelemetry: analysis.debugTelemetry,
+            landmarks: lm,
           };
           if (analysis.gesture !== 'MIRRORING') {
             detectedGesture = analysis.gesture;
@@ -394,17 +547,24 @@ export class VisionManager {
         } else {
           rHandDetected = true;
           rConf = score;
-          rightFusedWrist = lm[0];
+          rightFusedWrist = {
+            x: lm[0].x,
+            y: lm[0].y,
+            z: pLm?.[16]?.z ?? lm[0].z ?? 0,
+          };
           this.rightHandState = {
             detected: true,
             confidence: score,
             rawLabel: rawLabel as any,
             wristPos: { x: lm[0].x, y: lm[0].y, z: lm[0].z ?? 0 },
             wristOrientation: analysis.wristOri,
-            fingers: analysis.fingers,
+            fingers: analysis.robotFingers,
             gesture: analysis.gesture,
-            pinchDistance: analysis.pinchDist,
-            isGrip: analysis.isGrip,
+            palmSize: analysis.palmSize,
+            pinchDistance: analysis.pinchDistance,
+            isGrip: analysis.isPinch || analysis.gesture === 'FIST',
+            debugTelemetry: analysis.debugTelemetry,
+            landmarks: lm,
           };
           if (analysis.gesture !== 'MIRRORING') {
             detectedGesture = analysis.gesture;
@@ -413,6 +573,141 @@ export class VisionManager {
       });
 
       handLandmarksList = filteredHands;
+    }
+
+    // Active hand calibration frame accumulator
+    if (this.isCalibratingHand) {
+      if (
+        (this.calibrationSide === 'left' && lHandDetected) ||
+        (this.calibrationSide === 'right' && rHandDetected) ||
+        (this.calibrationSide === 'both' && (lHandDetected || rHandDetected))
+      ) {
+        this.calibrationSamples.push({
+          left: this.leftHandState.debugTelemetry?.fingers
+            ? {
+                thumb: this.leftHandState.debugTelemetry.fingers.thumb.raw,
+                index: this.leftHandState.debugTelemetry.fingers.index.raw,
+                middle: this.leftHandState.debugTelemetry.fingers.middle.raw,
+                ring: this.leftHandState.debugTelemetry.fingers.ring.raw,
+                pinky: this.leftHandState.debugTelemetry.fingers.pinky.raw,
+              }
+            : undefined,
+          right: this.rightHandState.debugTelemetry?.fingers
+            ? {
+                thumb: this.rightHandState.debugTelemetry.fingers.thumb.raw,
+                index: this.rightHandState.debugTelemetry.fingers.index.raw,
+                middle: this.rightHandState.debugTelemetry.fingers.middle.raw,
+                ring: this.rightHandState.debugTelemetry.fingers.ring.raw,
+                pinky: this.rightHandState.debugTelemetry.fingers.pinky.raw,
+              }
+            : undefined,
+          leftWidth: this.leftHandState.palmSize,
+          rightWidth: this.rightHandState.palmSize,
+        });
+
+        const progress = Math.min(100, Math.round((this.calibrationSamples.length / 25) * 100));
+        this.callbacks.onCalibrationProgress?.(progress);
+
+        if (this.calibrationSamples.length >= 25) {
+          const avgJoint = (
+            samples: Array<HandFingersState | undefined>,
+            f: keyof HandFingersState,
+            j: 'mcp' | 'pip' | 'dip'
+          ) => {
+            const vals = samples
+              .map(s => s?.[f]?.[j])
+              .filter((v): v is number => typeof v === 'number');
+            return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+          };
+
+          if (this.calibrationSide === 'left' || this.calibrationSide === 'both') {
+            const lSamples = this.calibrationSamples.map(s => s.left);
+            const lWidths = this.calibrationSamples
+              .map(s => s.leftWidth)
+              .filter((w): w is number => typeof w === 'number');
+            if (lSamples.some(s => !!s)) {
+              this.leftCalibration = {
+                ...this.leftCalibration,
+                isCalibrated: true,
+                palmWidthRef:
+                  lWidths.length > 0 ? lWidths.reduce((a, b) => a + b, 0) / lWidths.length : 0.08,
+                neutralAngles: {
+                  thumb: {
+                    mcp: avgJoint(lSamples, 'thumb', 'mcp'),
+                    pip: avgJoint(lSamples, 'thumb', 'pip'),
+                    dip: avgJoint(lSamples, 'thumb', 'dip'),
+                  },
+                  index: {
+                    mcp: avgJoint(lSamples, 'index', 'mcp'),
+                    pip: avgJoint(lSamples, 'index', 'pip'),
+                    dip: avgJoint(lSamples, 'index', 'dip'),
+                  },
+                  middle: {
+                    mcp: avgJoint(lSamples, 'middle', 'mcp'),
+                    pip: avgJoint(lSamples, 'middle', 'pip'),
+                    dip: avgJoint(lSamples, 'middle', 'dip'),
+                  },
+                  ring: {
+                    mcp: avgJoint(lSamples, 'ring', 'mcp'),
+                    pip: avgJoint(lSamples, 'ring', 'pip'),
+                    dip: avgJoint(lSamples, 'ring', 'dip'),
+                  },
+                  pinky: {
+                    mcp: avgJoint(lSamples, 'pinky', 'mcp'),
+                    pip: avgJoint(lSamples, 'pinky', 'pip'),
+                    dip: avgJoint(lSamples, 'pinky', 'dip'),
+                  },
+                },
+              };
+            }
+          }
+
+          if (this.calibrationSide === 'right' || this.calibrationSide === 'both') {
+            const rSamples = this.calibrationSamples.map(s => s.right);
+            const rWidths = this.calibrationSamples
+              .map(s => s.rightWidth)
+              .filter((w): w is number => typeof w === 'number');
+            if (rSamples.some(s => !!s)) {
+              this.rightCalibration = {
+                ...this.rightCalibration,
+                isCalibrated: true,
+                palmWidthRef:
+                  rWidths.length > 0 ? rWidths.reduce((a, b) => a + b, 0) / rWidths.length : 0.08,
+                neutralAngles: {
+                  thumb: {
+                    mcp: avgJoint(rSamples, 'thumb', 'mcp'),
+                    pip: avgJoint(rSamples, 'thumb', 'pip'),
+                    dip: avgJoint(rSamples, 'thumb', 'dip'),
+                  },
+                  index: {
+                    mcp: avgJoint(rSamples, 'index', 'mcp'),
+                    pip: avgJoint(rSamples, 'index', 'pip'),
+                    dip: avgJoint(rSamples, 'index', 'dip'),
+                  },
+                  middle: {
+                    mcp: avgJoint(rSamples, 'middle', 'mcp'),
+                    pip: avgJoint(rSamples, 'middle', 'pip'),
+                    dip: avgJoint(rSamples, 'middle', 'dip'),
+                  },
+                  ring: {
+                    mcp: avgJoint(rSamples, 'ring', 'mcp'),
+                    pip: avgJoint(rSamples, 'ring', 'pip'),
+                    dip: avgJoint(rSamples, 'ring', 'dip'),
+                  },
+                  pinky: {
+                    mcp: avgJoint(rSamples, 'pinky', 'mcp'),
+                    pip: avgJoint(rSamples, 'pinky', 'pip'),
+                    dip: avgJoint(rSamples, 'pinky', 'dip'),
+                  },
+                },
+              };
+            }
+          }
+
+          this.isCalibratingHand = false;
+          this.callbacks.onCalibrationComplete?.(this.leftCalibration, this.rightCalibration);
+        }
+      }
     }
 
     // Decay hand states smoothly when tracking is lost during fast motion blur
@@ -450,6 +745,7 @@ export class VisionManager {
     };
 
     let boundaryDeflectedInfo = undefined;
+    let latestKinematicDebug = undefined;
 
     if (poseResults && poseResults.landmarks && poseResults.landmarks.length > 0) {
       const rawPoseLandmarks = poseResults.landmarks[0];
@@ -474,6 +770,7 @@ export class VisionManager {
 
       Object.assign(robotAngles, retargeted);
       armSources = retargeted.activeArmSource;
+      latestKinematicDebug = retargeted.kinematicDebug;
       if (retargeted.boundaryMetrics) {
         boundaryDeflectedInfo = {
           left: retargeted.boundaryMetrics.leftDeflected,
@@ -521,6 +818,7 @@ export class VisionManager {
         faceConfidence: poseConf > 0.3 ? 0.9 : 0,
         activeArmSource: armSources,
         boundaryDeflected: boundaryDeflectedInfo,
+        kinematicDebug: latestKinematicDebug,
       },
     });
 

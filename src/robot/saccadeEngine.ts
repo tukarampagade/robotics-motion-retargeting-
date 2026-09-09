@@ -38,13 +38,13 @@ export class SaccadeEngine {
 
   // Predefined realistic environmental gaze fixation targets in the robotics lab
   private readonly labFixationTargets: SaccadeTarget[] = [
-    { x: 0.0, y: 0.02, duration: 55, dwellTime: 1800, label: 'FORWARD ATTENTIVE' },
-    { x: 0.45, y: -0.22, duration: 65, dwellTime: 1400, label: 'WORKBENCH TABLE' },
+    { x: 0.0, y: 0.02, duration: 55, dwellTime: 1800, label: 'FORWARD PATH' },
+    { x: 0.45, y: -0.22, duration: 65, dwellTime: 1400, label: 'RIGHT NAVIGATION WAYPOINT' },
     { x: -0.52, y: 0.08, duration: 70, dwellTime: 1600, label: 'LEFT INSTRUMENT RACK' },
     { x: 0.12, y: 0.35, duration: 60, dwellTime: 1200, label: 'OVERHEAD GANTRY' },
-    { x: -0.28, y: -0.15, duration: 50, dwellTime: 1500, label: 'ROBOT TORSO / CHEST' },
+    { x: -0.28, y: -0.15, duration: 50, dwellTime: 1500, label: 'ROBOT CHASSIS / DRIVE' },
     { x: 0.65, y: 0.1, duration: 75, dwellTime: 1300, label: 'RIGHT TELEMETRY SCREEN' },
-    { x: 0.0, y: -0.4, duration: 60, dwellTime: 1600, label: 'HAND PICK ZONE' },
+    { x: 0.0, y: -0.4, duration: 60, dwellTime: 1600, label: 'FORWARD OBSTACLE SCAN' },
     { x: -0.4, y: 0.3, duration: 65, dwellTime: 1100, label: 'LEFT SENSOR POD' },
     { x: 0.05, y: 0.05, duration: 45, dwellTime: 2000, label: 'CENTER CALIBRATION' },
   ];

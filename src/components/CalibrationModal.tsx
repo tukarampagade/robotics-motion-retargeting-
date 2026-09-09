@@ -21,9 +21,9 @@ export const CalibrationModal: React.FC<CalibrationModalProps> = ({
   if (!calibration.isCalibrating) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm select-none p-4">
-      <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl border border-slate-200/90 p-6 text-center animate-in fade-in zoom-in-95 duration-200">
-        <div className="w-14 h-14 rounded-2xl bg-cyan-50 border border-cyan-200 flex items-center justify-center text-cyan-600 mx-auto mb-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs select-none p-4">
+      <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl border border-slate-200 p-6 text-center animate-in fade-in zoom-in-95 duration-200 text-slate-700">
+        <div className="w-14 h-14 rounded-2xl bg-sky-50 border border-sky-200 flex items-center justify-center text-sky-600 mx-auto mb-4 shadow-2xs">
           <Compass className="w-7 h-7" />
         </div>
 
@@ -49,7 +49,7 @@ export const CalibrationModal: React.FC<CalibrationModalProps> = ({
               cx="56"
               cy="56"
               r="48"
-              stroke="#00b4d8"
+              stroke="#0284c7"
               strokeWidth="6"
               fill="none"
               strokeDasharray={301.6}
@@ -58,12 +58,12 @@ export const CalibrationModal: React.FC<CalibrationModalProps> = ({
               className="transition-all duration-100 ease-linear"
             />
           </svg>
-          <span className="absolute font-mono text-xl font-bold text-slate-800">
+          <span className="absolute font-mono text-xl font-bold text-slate-900">
             {Math.round(calibration.progress)}%
           </span>
         </div>
 
-        <p className="font-mono text-xs text-cyan-700 font-medium mb-6">
+        <p className="font-mono text-xs text-sky-700 font-medium mb-6">
           {!isCameraActive
             ? 'Starting camera feed for calibration...'
             : calibration.progress < 100
@@ -73,7 +73,7 @@ export const CalibrationModal: React.FC<CalibrationModalProps> = ({
 
         <button
           onClick={onCancel}
-          className="px-5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold font-mono transition-colors"
+          className="px-5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold font-mono transition-colors border border-slate-200 cursor-pointer shadow-2xs"
         >
           Cancel Calibration
         </button>
