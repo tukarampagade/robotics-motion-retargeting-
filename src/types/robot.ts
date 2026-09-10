@@ -17,6 +17,7 @@ export type GestureName =
   | 'POINT_RIGHT'
   | 'OPEN_PALM'
   | 'CLOSED_FIST'
+  | 'MIRRORING'
   | 'UNKNOWN'
   | 'NO_HAND';
 

@@ -99,14 +99,14 @@ export function classifyHandSign(
     const dTipWrist = dist(tip, wrist);
     const dPipWrist = dist(pip, wrist);
     const dTipMcp = dist(tip, mcp);
-    return dTipWrist > dPipWrist * 1.15 && dTipMcp > palmScale * 0.65;
+    return dTipWrist > dPipWrist * 1.10 && dTipMcp > palmScale * 0.60;
   };
 
   const isCurled = (tip: LandmarkPoint2D, pip: LandmarkPoint2D, mcp: LandmarkPoint2D) => {
     const dTipWrist = dist(tip, wrist);
     const dPipWrist = dist(pip, wrist);
     const dTipMcp = dist(tip, mcp);
-    return dTipWrist < dPipWrist * 1.05 || dTipMcp < palmScale * 0.55;
+    return dTipWrist < dPipWrist * 1.08 || dTipMcp < palmScale * 0.58;
   };
 
   const indexExtended = isExtended(indexTip, indexPip, indexMcp);
@@ -136,7 +136,7 @@ export function classifyHandSign(
   const tiltAngleRad = Math.atan2(dxHand, dyHand);
   const tiltAngleDeg = (tiltAngleRad * 180) / Math.PI;
 
-  // 1. OPEN PALM -> STOP
+  // 1. OPEN PALM -> STOP (all fingers extended and spread)
   if (allFourExtended) {
     return {
       gesture: 'OPEN_PALM',
@@ -148,12 +148,14 @@ export function classifyHandSign(
   }
 
   // 2. THUMB UP -> FORWARD
-  // 4 fingers curled, thumb pointing straight UP (thumbVectorY < -0.35 * palmScale)
-  // and thumb tip is above thumb MCP and wrist
+  // 4 fingers curled (or other 3 curled), thumb pointing straight UP in real world
+  // In screen Y: smaller Y is UP. Check that thumb tip is higher than thumb MCP and index MCP
   if (
-    allFourCurled &&
-    thumbVectorY < -palmScale * 0.35 &&
-    Math.abs(thumbVectorX) < Math.abs(thumbVectorY) * 1.5
+    (allFourCurled || (otherThreeCurled && !indexExtended)) &&
+    thumbVectorY < -palmScale * 0.22 &&
+    thumbTip.y < thumbMcp.y &&
+    thumbTip.y < indexMcp.y &&
+    Math.abs(thumbVectorX) < Math.abs(thumbVectorY) * 2.0
   ) {
     return {
       gesture: 'THUMB_UP',
@@ -165,11 +167,14 @@ export function classifyHandSign(
   }
 
   // 3. THUMB DOWN -> BACKWARD
-  // 4 fingers curled, thumb pointing straight DOWN (thumbVectorY > 0.35 * palmScale)
+  // 4 fingers curled (or other 3 curled), thumb pointing straight DOWN in real world
+  // In screen Y: larger Y is DOWN. Check that thumb tip is lower than thumb MCP and wrist
   if (
-    allFourCurled &&
-    thumbVectorY > palmScale * 0.35 &&
-    Math.abs(thumbVectorX) < Math.abs(thumbVectorY) * 1.5
+    (allFourCurled || (otherThreeCurled && !indexExtended)) &&
+    thumbVectorY > palmScale * 0.22 &&
+    thumbTip.y > thumbMcp.y &&
+    thumbTip.y > wrist.y &&
+    Math.abs(thumbVectorX) < Math.abs(thumbVectorY) * 2.0
   ) {
     return {
       gesture: 'THUMB_DOWN',
@@ -181,6 +186,7 @@ export function classifyHandSign(
   }
 
   // 4. CLOSED FIST -> STOP
+  // All 4 fingers curled, thumb tucked or resting
   if (allFourCurled) {
     return {
       gesture: 'CLOSED_FIST',
@@ -198,65 +204,66 @@ export function classifyHandSign(
   const indexAngleRad = Math.atan2(indexDirX, -indexDirY);
   const pointingAngleDeg = (indexAngleRad * 180) / Math.PI;
 
-  // Pointing Left:
-  // In mirrored view (what the user sees), pointing to user's left means dx < 0.
-  // We also accept when index finger points left and middle/ring/pinky are curled.
+  // Correct for camera mirroring:
+  // When mirrored (webcam mirror preview), pointing to the user's left appears on the left
+  // of the screen, which corresponds to positive delta X in the raw camera sensor.
+  const effectiveIndexDirX = isMirrored ? -indexDirX : indexDirX;
+  const effectiveTiltDeg = isMirrored ? -tiltAngleDeg : tiltAngleDeg;
+
+  // Pointing Left / Right with index finger extended while others are curled
   if (indexExtended && otherThreeCurled) {
-    // Check horizontal dominance: indexDirX has larger magnitude than indexDirY * 0.4
-    if (indexDirX < -palmScale * 0.3) {
+    if (effectiveIndexDirX < -palmScale * 0.22) {
       return {
         gesture: 'POINT_LEFT',
         command: 'LEFT',
         confidence: baseConfidence,
         timestamp,
         pointingAngleDeg,
-        tiltAngleDeg,
+        tiltAngleDeg: effectiveTiltDeg,
       };
     }
-    if (indexDirX > palmScale * 0.3) {
+    if (effectiveIndexDirX > palmScale * 0.22) {
       return {
         gesture: 'POINT_RIGHT',
         command: 'RIGHT',
         confidence: baseConfidence,
         timestamp,
         pointingAngleDeg,
-        tiltAngleDeg,
+        tiltAngleDeg: effectiveTiltDeg,
       };
     }
   }
 
-  // Tilt Left / Tilt Right support (hand tilted strongly left or right)
-  // Hand tilted left: tiltAngleDeg < -26°
-  // Hand tilted right: tiltAngleDeg > 26°
-  if (tiltAngleDeg < -26 && (indexExtended || middleExtended)) {
+  // Hand tilt Left / Right support (hand tilted strongly)
+  if (effectiveTiltDeg < -24 && (indexExtended || middleExtended)) {
     return {
       gesture: 'POINT_LEFT',
       command: 'LEFT',
       confidence: baseConfidence,
       timestamp,
       pointingAngleDeg,
-      tiltAngleDeg,
+      tiltAngleDeg: effectiveTiltDeg,
     };
   }
 
-  if (tiltAngleDeg > 26 && (indexExtended || middleExtended)) {
+  if (effectiveTiltDeg > 24 && (indexExtended || middleExtended)) {
     return {
       gesture: 'POINT_RIGHT',
       command: 'RIGHT',
       confidence: baseConfidence,
       timestamp,
       pointingAngleDeg,
-      tiltAngleDeg,
+      tiltAngleDeg: effectiveTiltDeg,
     };
   }
 
-  // Default: Unknown gesture -> Safe STOP
+  // Active hand present but in neutral / mirroring motion
   return {
-    gesture: 'UNKNOWN',
+    gesture: 'MIRRORING',
     command: 'STOP',
     confidence: baseConfidence,
     timestamp,
-    tiltAngleDeg,
+    tiltAngleDeg: effectiveTiltDeg,
   };
 }
 
@@ -275,6 +282,7 @@ export function mapGestureToCommand(gesture: GestureName): RobotCommand {
       return 'RIGHT';
     case 'OPEN_PALM':
     case 'CLOSED_FIST':
+    case 'MIRRORING':
     case 'NO_HAND':
     case 'UNKNOWN':
     default:

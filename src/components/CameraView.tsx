@@ -128,23 +128,32 @@ export const CameraView: React.FC<CameraViewProps> = ({
       </div>
 
       {/* Video & Canvas Container */}
-      <div className="relative flex-1 bg-black flex items-center justify-center min-h-0 overflow-hidden">
+      <div className="relative flex-1 bg-slate-950 flex items-center justify-center min-h-0 overflow-hidden">
         <video
           ref={videoRef}
           playsInline
           muted
           autoPlay
-          className="absolute inset-0 w-full h-full object-cover"
+          onLoadedMetadata={e => {
+            const v = e.currentTarget;
+            if (overlayCanvasRef.current && v.videoWidth > 0 && v.videoHeight > 0) {
+              overlayCanvasRef.current.width = v.videoWidth;
+              overlayCanvasRef.current.height = v.videoHeight;
+            }
+          }}
+          className="absolute inset-0 w-full h-full object-contain"
           style={{
             transform: isMirrorMode ? 'scaleX(-1)' : 'none',
+            transformOrigin: 'center center',
           }}
         />
 
         <canvas
           ref={overlayCanvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
+          className="absolute inset-0 w-full h-full object-contain pointer-events-none"
           style={{
             transform: isMirrorMode ? 'scaleX(-1)' : 'none',
+            transformOrigin: 'center center',
           }}
         />
 

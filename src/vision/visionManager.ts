@@ -52,8 +52,9 @@ export class VisionManager {
 
   private isRunning: boolean = false;
   private isProcessing: boolean = false;
-  private lastTimestampMs: number = 0;
+  private lastTimestampMs: number = Math.max(1000, Math.round(performance.now()));
   private lastVideoTime: number = -1;
+  private isRecoveringLandmarker: boolean = false;
 
   private animationFrameId: number | null = null;
   private visionIntervalId: number | null = null;
@@ -123,9 +124,10 @@ export class VisionManager {
   private targetIntervalMs: number = 0; // 0 = hardware frame-rate synchronized
 
   // Adaptive One Euro Filter banks for landmark jitter suppression with zero high-speed lag
-  private poseFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.3, 0.065);
-  private leftHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.5, 0.075);
-  private rightHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(1.5, 0.075);
+  private poseFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(0.8, 3.8);
+  private leftHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(0.75, 4.2);
+  private rightHandFilter: LandmarkOneEuroFilterSet = new LandmarkOneEuroFilterSet(0.75, 4.2);
+  private lastRunPerf: number = 0;
   private poseConfidenceThreshold: number = 0.25;
 
   constructor(callbacks: VisionCallbacks) {
@@ -167,20 +169,20 @@ export class VisionManager {
 
   public setResponsePreset(preset: 'ultra_fast' | 'balanced' | 'cinematic') {
     if (preset === 'ultra_fast') {
-      this.poseFilter = new LandmarkOneEuroFilterSet(1.4, 0.075);
-      this.leftHandFilter = new LandmarkOneEuroFilterSet(1.6, 0.085);
-      this.rightHandFilter = new LandmarkOneEuroFilterSet(1.6, 0.085);
+      this.poseFilter = new LandmarkOneEuroFilterSet(0.9, 5.5);
+      this.leftHandFilter = new LandmarkOneEuroFilterSet(0.85, 6.0);
+      this.rightHandFilter = new LandmarkOneEuroFilterSet(0.85, 6.0);
       this.targetIntervalMs = 0;
     } else if (preset === 'balanced') {
-      this.poseFilter = new LandmarkOneEuroFilterSet(1.2, 0.045);
-      this.leftHandFilter = new LandmarkOneEuroFilterSet(1.3, 0.055);
-      this.rightHandFilter = new LandmarkOneEuroFilterSet(1.3, 0.055);
-      this.targetIntervalMs = 18;
+      this.poseFilter = new LandmarkOneEuroFilterSet(0.8, 3.8);
+      this.leftHandFilter = new LandmarkOneEuroFilterSet(0.75, 4.2);
+      this.rightHandFilter = new LandmarkOneEuroFilterSet(0.75, 4.2);
+      this.targetIntervalMs = 0;
     } else {
-      this.poseFilter = new LandmarkOneEuroFilterSet(0.9, 0.018);
-      this.leftHandFilter = new LandmarkOneEuroFilterSet(1.0, 0.020);
-      this.rightHandFilter = new LandmarkOneEuroFilterSet(1.0, 0.020);
-      this.targetIntervalMs = 33;
+      this.poseFilter = new LandmarkOneEuroFilterSet(0.5, 2.0);
+      this.leftHandFilter = new LandmarkOneEuroFilterSet(0.5, 2.2);
+      this.rightHandFilter = new LandmarkOneEuroFilterSet(0.5, 2.2);
+      this.targetIntervalMs = 24;
     }
   }
 
@@ -189,7 +191,7 @@ export class VisionManager {
   }
 
   public resetTimestamps(): void {
-    this.lastTimestampMs = 0;
+    // Reset filters without rewinding the monotonic MediaPipe graph timestamp
     this.lastVideoTime = -1;
     this.poseFilter.reset();
     this.leftHandFilter.reset();
@@ -298,6 +300,53 @@ export class VisionManager {
     }
   }
 
+  private async recoverLandmarker(type: 'hand' | 'pose'): Promise<void> {
+    if (this.isRecoveringLandmarker || !this.visionResolver) return;
+    this.isRecoveringLandmarker = true;
+    try {
+      console.info(`Auto-recovering MediaPipe ${type} landmarker graph...`);
+      if (type === 'hand') {
+        try { this.handLandmarker?.close(); } catch {}
+        this.handLandmarker = null;
+        this.handLandmarker = await HandLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.25,
+          minHandPresenceConfidence: 0.25,
+          minTrackingConfidence: 0.25,
+        });
+      } else {
+        try { this.poseLandmarker?.close(); } catch {}
+        this.poseLandmarker = null;
+        const poseModelPath =
+          this.poseQuality === 'lite'
+            ? 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task'
+            : 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task';
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(this.visionResolver, {
+          baseOptions: {
+            modelAssetPath: poseModelPath,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.35,
+          minTrackingConfidence: 0.35,
+        });
+      }
+      console.info(`MediaPipe ${type} landmarker recovered successfully.`);
+    } catch (err) {
+      console.warn(`Failed to recover ${type} landmarker:`, err);
+    } finally {
+      this.isRecoveringLandmarker = false;
+    }
+  }
+
   public setMotionGain(gain: number) {
     this.motionGain = gain;
   }
@@ -313,7 +362,6 @@ export class VisionManager {
     if (this.isRunning) return;
     this.isRunning = true;
     this.isProcessing = false;
-    this.lastTimestampMs = 0;
     this.lastVideoTime = -1;
 
     let lastRunTime = 0;
@@ -368,11 +416,15 @@ export class VisionManager {
 
     // Strict monotonic timestamp generation to eliminate MediaPipe freeze / crash
     const currentPerf = performance.now();
-    const videoTimeMs = Math.round(video.currentTime * 1000);
-    const monotonicTimestamp = Math.max(
-      this.lastTimestampMs + 4,
-      videoTimeMs > 0 ? videoTimeMs : Math.round(currentPerf)
-    );
+    const frameDtSec = Math.max(0.008, Math.min(0.08, (currentPerf - (this.lastRunPerf || (currentPerf - 33))) / 1000));
+    this.lastRunPerf = currentPerf;
+
+    // Strict monotonic timestamp generation to eliminate MediaPipe freeze / crash.
+    // MediaPipe's VIDEO mode requires timestamps that strictly increase monotonically.
+    // We base timestamps purely on high-precision performance.now(), guaranteeing it
+    // always strictly advances and never drops backwards when video loops or restarts.
+    const perfMs = Math.round(currentPerf);
+    const monotonicTimestamp = Math.max(this.lastTimestampMs + 4, perfMs);
     const handTimestamp = monotonicTimestamp + 1;
     const poseTimestamp = monotonicTimestamp + 2;
     this.lastTimestampMs = poseTimestamp;
@@ -384,16 +436,32 @@ export class VisionManager {
     let handResults: any = null;
     try {
       handResults = this.handLandmarker.detectForVideo(video, handTimestamp);
-    } catch (e) {
-      // Guard against momentary buffer loss during fast motion scenes
+    } catch (e: any) {
+      const errMsg = e?.message || String(e);
+      console.warn('HandLandmarker frame detection warning:', errMsg);
+      if (
+        errMsg.includes('timestamp mismatch') ||
+        errMsg.includes('Graph has errors') ||
+        errMsg.includes('Run() failed')
+      ) {
+        this.recoverLandmarker('hand');
+      }
     }
 
     // 2. Detect Pose Landmarks
     let poseResults: any = null;
     try {
       poseResults = this.poseLandmarker.detectForVideo(video, poseTimestamp);
-    } catch (e) {
-      // Guard against momentary frame drop
+    } catch (e: any) {
+      const errMsg = e?.message || String(e);
+      console.warn('PoseLandmarker frame detection warning:', errMsg);
+      if (
+        errMsg.includes('timestamp mismatch') ||
+        errMsg.includes('Graph has errors') ||
+        errMsg.includes('Run() failed')
+      ) {
+        this.recoverLandmarker('pose');
+      }
     }
 
     const inferenceLatencyMs = performance.now() - startTime;
@@ -499,8 +567,8 @@ export class VisionManager {
         // Apply Adaptive One Euro Filter to hand landmarks to suppress tracking tremor
         const lm = this.useOneEuroFilter
           ? label === 'Left'
-            ? this.leftHandFilter.filterLandmarks(rawLm, monotonicTimestamp)
-            : this.rightHandFilter.filterLandmarks(rawLm, monotonicTimestamp)
+            ? this.leftHandFilter.filterLandmarks(rawLm, currentPerf)
+            : this.rightHandFilter.filterLandmarks(rawLm, currentPerf)
           : rawLm;
 
         filteredHands.push(lm);
@@ -516,7 +584,7 @@ export class VisionManager {
           pinchDet,
           occlTracker,
           calProfile,
-          0.033
+          frameDtSec
         );
 
         if (label === 'Left') {
@@ -751,7 +819,7 @@ export class VisionManager {
       const rawPoseLandmarks = poseResults.landmarks[0];
       // Filter pose landmarks using One Euro Filter
       poseLandmarks = this.useOneEuroFilter
-        ? this.poseFilter.filterLandmarks(rawPoseLandmarks, monotonicTimestamp)
+        ? this.poseFilter.filterLandmarks(rawPoseLandmarks, currentPerf)
         : rawPoseLandmarks;
 
       const keyPoints = [11, 12, 13, 14, 15, 16, 23, 24];

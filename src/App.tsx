@@ -70,12 +70,18 @@ const POSE_CONNECTIONS: [number, number][] = [
 ];
 
 const HAND_CONNECTIONS: [number, number][] = [
+  // Thumb chain
   [0, 1], [1, 2], [2, 3], [3, 4],
+  // Index finger chain
   [0, 5], [5, 6], [6, 7], [7, 8],
-  [0, 9], [9, 10], [10, 11], [11, 12],
-  [0, 13], [13, 14], [14, 15], [15, 16],
-  [0, 17], [17, 18], [18, 19], [19, 20],
-  [5, 9], [9, 13], [13, 17],
+  // Middle finger chain
+  [9, 10], [10, 11], [11, 12],
+  // Ring finger chain
+  [13, 14], [14, 15], [15, 16],
+  // Pinky finger chain
+  [17, 18], [18, 19], [19, 20],
+  // Palm perimeter (knuckles & heel)
+  [5, 9], [9, 13], [13, 17], [0, 17],
 ];
 
 export default function App() {
@@ -167,11 +173,12 @@ export default function App() {
     enabled: settings.enableHandSignControl,
   });
 
-  // MediaPipe Hand Gesture Recognition Hook (3 consecutive frames stability filter)
+  // MediaPipe Hand Gesture Recognition Hook (consecutive frames stability filter)
   const {
     stableGesture,
     isHandDetected,
     processFrame,
+    processHands,
     resetGestureState,
     candidateCount,
   } = useHandGestureRecognition({
@@ -179,9 +186,11 @@ export default function App() {
   });
 
   const processFrameRef = useRef(processFrame);
+  const processHandsRef = useRef(processHands);
   useEffect(() => {
     processFrameRef.current = processFrame;
-  }, [processFrame]);
+    processHandsRef.current = processHands;
+  }, [processFrame, processHands]);
 
   // Connect stable recognized hand signs to robot command engine
   useEffect(() => {
@@ -641,23 +650,12 @@ export default function App() {
           targetRightFingersRef.current = data.rightHand.fingers;
         }
 
-        // Feed dominant hand landmarks to Hand-Sign Robot Control
-        const dominantHand =
-          data.rightHand.detected && data.rightHand.landmarks
-            ? data.rightHand
-            : data.leftHand.detected && data.leftHand.landmarks
-            ? data.leftHand
-            : null;
-
-        if (dominantHand && dominantHand.landmarks) {
-          processFrameRef.current?.(
-            dominantHand.landmarks,
-            dominantHand.confidence,
-            settingsRef.current.mirrorView
-          );
-        } else {
-          processFrameRef.current?.(null, 0, settingsRef.current.mirrorView);
-        }
+        // Feed hands landmarks to Hand-Sign Robot Control (independent two-hand tracking)
+        processHandsRef.current?.(
+          data.leftHand.detected ? data.leftHand : null,
+          data.rightHand.detected ? data.rightHand : null,
+          settingsRef.current.mirrorView
+        );
 
         // Determine state label
         let nextResponse = 'STANDBY';
@@ -737,6 +735,17 @@ export default function App() {
       onOverlayDraw: (poseLm, handsLm) => {
         const canvas = overlayCanvasRef.current;
         if (!canvas) return;
+
+        // Ensure canvas internal resolution always exactly matches video dimensions
+        // so that CSS object-contain scales and positions both elements identically without drift or stretch
+        const video = videoRef.current;
+        if (video && video.videoWidth > 0 && video.videoHeight > 0) {
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+        }
+
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
@@ -772,26 +781,62 @@ export default function App() {
         }
 
         // Draw Hands Knuckles and 21 Finger Landmarks
-        if (settingsRef.current.showFingers && handsLm) {
+        if (settingsRef.current.showFingers && handsLm && handsLm.length > 0) {
           handsLm.forEach(hand => {
+            if (!hand || hand.length < 21) return;
+
+            // Draw anatomical bones: clean, thin cyan/blue skeleton
+            ctx.save();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
             ctx.lineWidth = 1.8;
-            ctx.strokeStyle = 'rgba(0, 210, 255, 0.85)';
+            ctx.strokeStyle = 'rgba(6, 182, 212, 0.9)'; // Clean cyan
+
             ctx.beginPath();
             HAND_CONNECTIONS.forEach(([a, b]) => {
-              if (hand[a] && hand[b]) {
-                ctx.moveTo(hand[a].x * w, hand[a].y * h);
-                ctx.lineTo(hand[b].x * w, hand[b].y * h);
+              const pA = hand[a];
+              const pB = hand[b];
+              if (pA && pB) {
+                ctx.moveTo(pA.x * w, pA.y * h);
+                ctx.lineTo(pB.x * w, pB.y * h);
               }
             });
             ctx.stroke();
 
-            // 21 knuckle dots
+            // Draw actual 21 landmark points
             hand.forEach((p, pIdx) => {
+              if (!p) return;
+              const px = p.x * w;
+              const py = p.y * h;
+
               ctx.beginPath();
-              ctx.fillStyle = pIdx === 0 ? '#f59e0b' : pIdx % 4 === 0 ? '#00e5ff' : '#ffffff';
-              ctx.arc(p.x * w, p.y * h, pIdx === 0 ? 3.5 : 2.2, 0, Math.PI * 2);
-              ctx.fill();
+              if (pIdx === 0) {
+                // Wrist joint: amber anchor point
+                ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+                ctx.fillStyle = '#f59e0b';
+                ctx.fill();
+                ctx.lineWidth = 1.0;
+                ctx.strokeStyle = '#ffffff';
+                ctx.stroke();
+              } else if (pIdx % 4 === 0) {
+                // Fingertips: thumb (4), index (8), middle (12), ring (16), pinky (20)
+                ctx.arc(px, py, 2.8, 0, Math.PI * 2);
+                ctx.fillStyle = '#00f0ff';
+                ctx.fill();
+                ctx.lineWidth = 1.0;
+                ctx.strokeStyle = '#ffffff';
+                ctx.stroke();
+              } else {
+                // Knuckle and intermediate joints
+                ctx.arc(px, py, 2.0, 0, Math.PI * 2);
+                ctx.fillStyle = '#ffffff';
+                ctx.fill();
+                ctx.lineWidth = 0.8;
+                ctx.strokeStyle = '#0891b2';
+                ctx.stroke();
+              }
             });
+            ctx.restore();
           });
         }
       },
@@ -988,6 +1033,13 @@ export default function App() {
         videoRef.current.srcObject = null;
       }
       visionManagerRef.current?.stop();
+      if (overlayCanvasRef.current) {
+        const ctx = overlayCanvasRef.current.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, overlayCanvasRef.current.width, overlayCanvasRef.current.height);
+        }
+      }
+      resetGestureState();
       setIsCameraActive(false);
       if (mode === 'LIVE') setMode('DEMO');
     } else {

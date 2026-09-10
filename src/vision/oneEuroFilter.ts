@@ -52,12 +52,18 @@ export class OneEuroFilter {
   private dxFilter: LowPassFilter;
   private lastTime: number | null = null;
 
-  constructor(minCutoff: number = 1.0, beta: number = 0.007, dCutoff: number = 1.0) {
+  constructor(minCutoff: number = 0.75, beta: number = 4.2, dCutoff: number = 1.0) {
     this.minCutoff = minCutoff;
     this.beta = beta;
     this.dCutoff = dCutoff;
     this.xFilter = new LowPassFilter();
     this.dxFilter = new LowPassFilter();
+  }
+
+  public setParameters(minCutoff: number, beta: number, dCutoff: number = 1.0): void {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
   }
 
   private alpha(rate: number, cutoff: number): number {
@@ -67,12 +73,13 @@ export class OneEuroFilter {
   }
 
   public filter(val: number, timestamp: number): number {
-    if (this.lastTime === null || timestamp <= this.lastTime) {
+    if (this.lastTime === null) {
       this.lastTime = timestamp;
       return this.xFilter.filter(val, 1.0);
     }
 
-    const dt = Math.max(0.001, (timestamp - this.lastTime) / 1000.0);
+    // Protect against non-monotonic or microsecond duplicate timestamps
+    const dt = Math.max(0.001, Math.min(0.2, (timestamp - this.lastTime) / 1000.0));
     this.lastTime = timestamp;
     const rate = 1.0 / dt;
 
@@ -81,7 +88,7 @@ export class OneEuroFilter {
     const dx = (val - prevVal) * rate;
     const edx = this.dxFilter.filter(dx, this.alpha(rate, this.dCutoff));
 
-    // Compute adaptive cutoff frequency
+    // Compute adaptive cutoff frequency (smooth stationary hands, zero lag at speed)
     const cutoff = this.minCutoff + this.beta * Math.abs(edx);
     return this.xFilter.filter(val, this.alpha(rate, cutoff));
   }
@@ -101,10 +108,16 @@ export class OneEuroFilter3D {
   private fy: OneEuroFilter;
   private fz: OneEuroFilter;
 
-  constructor(minCutoff: number = 1.0, beta: number = 0.008, dCutoff: number = 1.0) {
+  constructor(minCutoff: number = 0.75, beta: number = 4.2, dCutoff: number = 1.0) {
     this.fx = new OneEuroFilter(minCutoff, beta, dCutoff);
     this.fy = new OneEuroFilter(minCutoff, beta, dCutoff);
-    this.fz = new OneEuroFilter(minCutoff, beta, dCutoff);
+    this.fz = new OneEuroFilter(minCutoff, beta * 0.85, dCutoff);
+  }
+
+  public setParameters(minCutoff: number, beta: number, dCutoff: number = 1.0): void {
+    this.fx.setParameters(minCutoff, beta, dCutoff);
+    this.fy.setParameters(minCutoff, beta, dCutoff);
+    this.fz.setParameters(minCutoff, beta * 0.85, dCutoff);
   }
 
   public filter(
@@ -133,10 +146,19 @@ export class LandmarkOneEuroFilterSet {
   private filters: Map<number, OneEuroFilter3D> = new Map();
   private minCutoff: number;
   private beta: number;
+  private dCutoff: number;
 
-  constructor(minCutoff: number = 1.2, beta: number = 0.012) {
+  constructor(minCutoff: number = 0.75, beta: number = 4.2, dCutoff: number = 1.0) {
     this.minCutoff = minCutoff;
     this.beta = beta;
+    this.dCutoff = dCutoff;
+  }
+
+  public setParameters(minCutoff: number, beta: number, dCutoff: number = 1.0): void {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.filters.forEach(f => f.setParameters(minCutoff, beta, dCutoff));
   }
 
   public filterLandmarks<T extends { x: number; y: number; z?: number; visibility?: number }>(
@@ -146,7 +168,7 @@ export class LandmarkOneEuroFilterSet {
     return landmarks.map((lm, idx) => {
       let f = this.filters.get(idx);
       if (!f) {
-        f = new OneEuroFilter3D(this.minCutoff, this.beta);
+        f = new OneEuroFilter3D(this.minCutoff, this.beta, this.dCutoff);
         this.filters.set(idx, f);
       }
       return f.filter(lm, timestamp) as T;
